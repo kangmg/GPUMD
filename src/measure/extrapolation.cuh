@@ -77,7 +77,9 @@ public:
   GPU_Vector<double> B;          // N x B_size
   GPU_Vector<double> gamma_full; // N x B_size
   GPU_Vector<double> gamma;      // maximum of each component: N
+  std::vector<double> cpu_gamma; // host mirror of gamma (WSL2: no managed host access)
   GPU_Vector<double*> blas_A, blas_x, blas_y;
+  std::vector<double*> cpu_blas_A; // host staging for blas_A (device ptr array)
   Atom* atom;
   Box* box;
   int B_size_per_atom;

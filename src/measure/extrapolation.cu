@@ -95,21 +95,30 @@ void Extrapolation::preprocess(
     printf("The length of B vector for each atom: %d\n", B_size_per_atom);
   B.resize(B_size_per_atom * N);
   gamma_full.resize(B_size_per_atom * N);
-  gamma.resize(N, Memory_Type::managed);
+  // Device memory (not managed) + explicit host mirrors: WSL2 does not support host
+  // access to cudaMallocManaged buffers after device kernels run, which segfaults the
+  // original managed gamma / blas pointer arrays. See the fix note in calculate_gamma.
+  gamma.resize(N);
+  cpu_gamma.resize(N);
   force.potentials[0]->B_projection = B.data();
   force.potentials[0]->need_B_projection = true;
   this->atom = &atom;
   this->box = &box;
   f = my_fopen("extrapolation_dump.xyz", "a");
 
-  blas_A.resize(N, Memory_Type::managed);
-  blas_x.resize(N, Memory_Type::managed);
-  blas_y.resize(N, Memory_Type::managed);
-  load_asi();
+  blas_A.resize(N);
+  blas_x.resize(N);
+  blas_y.resize(N);
+  cpu_blas_A.resize(N);
+  load_asi(); // fills cpu_blas_A (host) with each atom's device asi pointer
+  blas_A.copy_from_host(cpu_blas_A.data());
+  std::vector<double*> host_x(N), host_y(N);
   for (int i = 0; i < N; i++) {
-    blas_x[i] = B.data() + i * B_size_per_atom;
-    blas_y[i] = gamma_full.data() + i * B_size_per_atom;
+    host_x[i] = B.data() + i * B_size_per_atom;
+    host_y[i] = gamma_full.data() + i * B_size_per_atom;
   }
+  blas_x.copy_from_host(host_x.data());
+  blas_y.copy_from_host(host_y.data());
 
   gpublasCreate(&handle);
   printf("gamma_low:      %f\n", gamma_low);
@@ -158,17 +167,22 @@ void Extrapolation::load_asi()
         type_of_atom,
         shape1,
         shape2);
+      // Device (global) memory, not managed: cuBLAS reads this matrix directly, and
+      // reading a cudaMallocManaged buffer from cuBLAS segfaults on WSL2 (incomplete
+      // unified-memory support). Read into a host buffer, then copy to the device.
       asi_list.emplace_back(
-        std::unique_ptr<GPU_Vector<double>>(new GPU_Vector<double>(B_size, Memory_Type::managed)));
+        std::unique_ptr<GPU_Vector<double>>(new GPU_Vector<double>(B_size)));
       auto& asi = asi_list.back();
+      std::vector<double> asi_host(B_size);
       for (int i = 0; i < B_size; ++i) {
-        f >> (*asi)[i];
+        f >> asi_host[i];
       }
-      printf("[%f %f ... %f]\n", (*asi)[0], (*asi)[1], (*asi)[B_size - 1]);
+      asi->copy_from_host(asi_host.data());
+      printf("[%f %f ... %f]\n", asi_host[0], asi_host[1], asi_host[B_size - 1]);
 
       for (int j = 0; j < atom->number_of_atoms; j++) {
         if (atom->cpu_type[j] == type_of_atom) {
-          blas_A[j] = asi->data();
+          cpu_blas_A[j] = asi->data();
         }
       }
     }
@@ -197,8 +211,8 @@ void Extrapolation::process(
     calculate_gamma();
     max_gamma = 0;
     for (int i = 0; i < atom.number_of_atoms; i++) {
-      if (gamma[i] > max_gamma)
-        max_gamma = gamma[i];
+      if (cpu_gamma[i] > max_gamma)
+        max_gamma = cpu_gamma[i];
     }
     if (max_gamma > gamma_high) {
       dump();
@@ -229,12 +243,12 @@ void Extrapolation::calculate_gamma()
       B_size_per_atom,
       B_size_per_atom,
       &alpha,
-      blas_A[i],
+      cpu_blas_A[i],
       B_size_per_atom,
-      blas_x[i],
+      B.data() + i * B_size_per_atom,
       1,
       &beta,
-      blas_y[i],
+      gamma_full.data() + i * B_size_per_atom,
       1);
   }
 #else
@@ -257,6 +271,9 @@ void Extrapolation::calculate_gamma()
   gpu_calculate_max_gamma<<<(N - 1) / 128 + 1, 128>>>(
     gamma_full.data(), gamma.data(), N, B_size_per_atom);
   gpuDeviceSynchronize();
+  // Mirror gamma to the host: process()/dump() read it on the CPU, and a managed
+  // buffer isn't host-accessible after the kernel on WSL2.
+  gamma.copy_to_host(cpu_gamma.data());
 }
 
 void Extrapolation::dump()
@@ -297,6 +314,6 @@ void Extrapolation::dump()
     for (int d = 0; d < 3; ++d) {
       fprintf(f, " %.8f", atom->cpu_position_per_atom[n + num_atoms_total * d]);
     }
-    fprintf(f, " %8f\n", gamma[n]);
+    fprintf(f, " %8f\n", cpu_gamma[n]);
   }
 }
