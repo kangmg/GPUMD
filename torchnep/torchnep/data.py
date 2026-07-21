@@ -317,6 +317,12 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lr"] = float(parts[1])
             elif key == "scheduler_patience":
                 params["scheduler_patience"] = int(parts[1])
+            elif key == "early_stop_patience":
+                # epochs with no true-loss improvement (post true_eval_start)
+                # before training stops early. No setdefault below -- absent
+                # means disabled, matching the pre-existing always-run-to-
+                # num_epochs behavior.
+                params["early_stop_patience"] = int(parts[1])
             elif key == "scheduler_factor":
                 params["scheduler_factor"] = float(parts[1])
             elif key == "stop_lr":

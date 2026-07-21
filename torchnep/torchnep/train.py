@@ -175,6 +175,9 @@ def format_config_summary(config: dict) -> List[str]:
                  f"{config['scheduler_patience']}")
     lines.append(f"  {tag('scheduler_factor'):10}  factor       "
                  f"{config['scheduler_factor']}")
+    if "early_stop_patience" in config:
+        lines.append(f"  {tag('early_stop_patience'):10}  early_stop   "
+                     f"{config['early_stop_patience']} epochs with no true-loss improvement")
     lines.append(f"  {tag('max_grad_norm'):10}  max_grad     {config['max_grad_norm']}")
     lines.append(f"  {tag('lambda_e'):10}  lambda_e     {config['lambda_e']}")
     lines.append(f"  {tag('lambda_f'):10}  lambda_f     {config['lambda_f']}")
@@ -1157,6 +1160,7 @@ def train_nep(
     stop_lr            = config["stop_lr"]
     scheduler_patience = config["scheduler_patience"]
     scheduler_factor   = config["scheduler_factor"]
+    early_stop_patience = config.get("early_stop_patience")  # None -> disabled
     lr_scheduler_mode  = config["lr_scheduler"]     # "plateau" | "step"
     max_grad_norm      = config["max_grad_norm"]
     pref_e             = config["lambda_e"]
@@ -1392,6 +1396,7 @@ def train_nep(
     start_epoch = 1
     best_loss = float("inf")
     best_true_loss = float("inf")
+    epochs_since_best_true_loss = 0  # early_stop_patience bookkeeping
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
     if resume_from is not None and finetune_from is not None:
         raise ValueError("resume_from and finetune_from are mutually "
@@ -1706,13 +1711,25 @@ def train_nep(
             # averaging as the screen numbers) beats the best true loss so
             # far. The final epoch is always evaluated, so nep_best can
             # never end up worse than nep_final.
+            #
+            # `will_early_stop` is decided from the PREVIOUS epoch's streak
+            # (epochs_since_best_true_loss, updated below) -- once patience
+            # is exhausted, THIS epoch gets full "final epoch" treatment
+            # (forced true-loss eval, so nep_final's b1 solve matches nep_best's
+            # comparison the same way it does for epoch == num_epochs) and is
+            # the last one run.
+            will_early_stop = (
+                early_stop_patience is not None
+                and epoch >= true_eval_start
+                and epochs_since_best_true_loss >= early_stop_patience
+            )
             new_min = avg_loss < best_loss
             if new_min:
                 best_loss = avg_loss
             if epoch < true_eval_start:
                 if new_min:
                     _save_best()
-            elif new_min or epoch == num_epochs:
+            elif new_min or epoch == num_epochs or will_early_stop:
                 t_loss, _te, _tf, _tv = _evaluate_true_loss(
                     data_store, batch_size, raw_model,
                     compute_props, compute_props_cached,
@@ -1721,8 +1738,13 @@ def train_nep(
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
                     _save_best()
+                    epochs_since_best_true_loss = 0
+                elif epoch >= true_eval_start:
+                    epochs_since_best_true_loss += 1
+            elif epoch >= true_eval_start:
+                epochs_since_best_true_loss += 1
 
-            if epoch % checkpoint_interval == 0 or epoch == num_epochs:
+            if epoch % checkpoint_interval == 0 or epoch == num_epochs or will_early_stop:
                 _save_checkpoint(
                     ckpt_path, model, optimizer,
                     stage2_scheduler if in_stage2 else lr_scheduler,
@@ -1738,16 +1760,24 @@ def train_nep(
             # epoch's displayed loss (current weights = end-of-epoch, whereas
             # the screen average covers weights that were still improving
             # throughout the epoch).
-            # Skip on the final epoch — the end-of-training predict (below)
-            # immediately overwrites these files with the final-epoch result.
+            # Skip on the final epoch (or an early-stopping one) — the
+            # end-of-training predict (below) immediately overwrites these
+            # files with the final-epoch result.
             if (prediction_interval > 0
                     and epoch % prediction_interval == 0
-                    and epoch != num_epochs):
+                    and epoch != num_epochs
+                    and not will_early_stop):
                 # Silent interim predict — reuses data_store's preprocessed
                 # neighbor lists + basis (no xyz re-read, no recompute).
                 predict_from_store(raw_model, data_store, output_dir,
                                    batch_size=batch_size, backend=backend,
                                    verbose=False)
+
+            if will_early_stop:
+                _log(f"Early stopping at epoch {epoch}: no true-loss "
+                     f"improvement for {early_stop_patience} epochs "
+                     f"(best_true_loss={best_true_loss:.4e}).")
+                break
     finally:
         if loss_log is not None:
             loss_log.close()
