@@ -85,11 +85,6 @@ Examples
 ========
 
 You can find several examples for how to use both the ``gpumd`` and ``nep`` executables in `the examples directory <https://github.com/brucefan1983/GPUMD/tree/master/examples>`_ of the :program:`GPUMD` repository.
-
-
-.. _netcdf_setup:
-.. index::
-   single: NetCDF setup
    
 GNEP setup
 ==========
@@ -112,7 +107,7 @@ See the `implementation paper <https://doi.org/10.1016/j.cpc.2025.109994/>`_ for
         cmake --build build --target gnep
 
 The usage of the ``gnep`` executable is similar to that of the ``nep`` executable.
-The major difference is that training hyperparameters are written in ``gnep.in`` instead of ``nep.in``'
+The major difference is that training hyperparameters are written in ``gnep.in`` instead of ``nep.in``
 Below we use an explicit example with default parameters (except for the ``type`` keyword) to illustrate the inputs in ``gnep.in``::
 
   type         2 Ge Se      # same usage as in nep.in
@@ -128,19 +123,79 @@ Below we use an explicit example with default parameters (except for the ``type`
   start_lr     1e-3         # new keyword to set the starting learning rate, which should be a non-negative floating-point number
   stop_lr      1e-7         # new keyword to set the stopping learning rate, which should be a non-negative floating-point number
   weight_decay 0.0          # new keyword to set the weight decay parameter, which should be a non-negative floating-point number
-  batch        2            # same usage as in nep.in but favors small values
+  batch        2            # global batch size; it does not grow with the number of visible GPUs
   epoch        50           # one epoch equals #structures/#batchsize training steps
+  seed         20260831     # optional non-negative seed for parameter initialization and batch shuffling
+
+GNEP uses every GPU made visible through ``CUDA_VISIBLE_DEVICES`` on one node.
+Each complete configuration belongs to exactly one GPU shard; configurations
+are never split across devices. A training step still performs one global Adam
+update, so ``batch`` has the same meaning for one, two, or more GPUs. For
+example, the following commands run an otherwise identical deterministic job
+on one, two, and four GPUs::
+
+  CUDA_VISIBLE_DEVICES=0 ./gnep
+  CUDA_VISIBLE_DEVICES=0,1 ./gnep
+  CUDA_VISIBLE_DEVICES=0,1,2,3 ./gnep
+
+Global batch size and multi-GPU efficiency
+------------------------------------------
+
+The ``batch`` keyword is the number of complete configurations used by one
+global Adam update across all visible GPUs. It is a global batch size, not a
+per-GPU batch size, and it must be kept unchanged when comparing otherwise
+identical one-, two-, and four-GPU runs. Changing ``batch`` changes the
+optimization problem seen by each Adam step and can therefore change the
+training trajectory.
+
+GNEP distributes complete configurations and never splits the atoms or
+neighbor graph of one configuration across GPUs. Consequently, the number of
+active GPUs in a step is::
+
+  min(number of visible GPUs, number of configurations in the current batch)
+
+``batch 1`` is valid and follows the same training algorithm, but only one GPU
+can perform useful work in each step. To allow every visible GPU to participate,
+use a global batch of at least 2 for two GPUs or at least 4 for four GPUs. The
+last incomplete batch of an epoch can use fewer GPUs when it contains fewer
+configurations. For example, a global batch of 4 is analogous to assigning one
+configuration to each of four GPUs before one synchronized Adam update; it is
+not equivalent to four independent ``batch 1`` updates.
+
+Multi-GPU efficiency depends on the amount of work in each global batch. Very
+small configurations or a small global batch can be slower on multiple GPUs
+because host worker startup, gradient reduction, and synchronization dominate
+the GPU computation. Increase ``batch`` only as permitted by GPU memory and the
+desired optimization behavior. Benchmark with the same global batch, dataset,
+seed, and number of epochs on every GPU count, and exclude the first warm-up
+step when reporting step time.
+
+As a reference rather than a hardware-independent guarantee, a validation run
+with 3810 training configurations, 100 test configurations, global ``batch 80``,
+and RTX 4090 GPUs measured median step times of 0.462856, 0.263450, and 0.151553
+seconds on one, two, and four GPUs, respectively. These correspond to 1.76x and
+3.05x speedups, while the serialized loss and RMSE trajectories were identical
+for all three runs.
+
+When ``seed`` is omitted, GNEP retains the historical behavior: parameter
+initialization uses its existing default seed and epoch batch shuffling obtains
+entropy from ``std::random_device``. Model, restart, prediction, and training
+output formats are unchanged.
+
+.. _netcdf_setup:
+.. index::
+   single: NetCDF setup
 
 NetCDF setup
 ============
 
 To use `NetCDF <https://www.unidata.ucar.edu/software/netcdf/>`_ (see :ref:`dump_netcdf keyword <kw_dump_netcdf>`) with :program:`GPUMD`, a few extra steps must be taken before building :program:`GPUMD`.
-First, you must download and install the correct version of NetCDF.
-Currently, :program:`GPUMD` is coded to work with `netCDF-C 4.6.3 <https://github.com/Unidata/netcdf-c/releases/tag/v4.6.3>`_ and it is recommended that this version is used (not newer versions).
+First, you must download and install a compatible version of NetCDF.
+:program:`GPUMD` requires netCDF-C 4.6.3 or later; version 4.6.3 remains a known-compatible baseline.
 
 The setup instructions are below:
 
-* Download `netCDF-C 4.6.3 <https://github.com/Unidata/netcdf-c/releases/tag/v4.6.3>`_
+* Download `netCDF-C 4.6.3 <https://github.com/Unidata/netcdf-c/releases/tag/v4.6.3>`_ or a `newer release <https://github.com/Unidata/netcdf-c/releases>`_.
 * Configure and build NetCDF.
   It is best to follow the instructions included with the software but, for the configuration, please use the following flags seen in our example line
 
@@ -148,7 +203,13 @@ The setup instructions are below:
 
      ./configure --prefix=<path> --disable-netcdf-4 --disable-dap
 
-  Here, the :attr:`--prefix` determines the output directory of the build. Then make and install NetCDF:
+  This configuration supports the default uncompressed NetCDF output and avoids the
+  additional HDF5 and zlib dependencies. To use the optional ``compression deflate``
+  mode, install NetCDF-C with NetCDF4/HDF5 and zlib support by omitting
+  ``--disable-netcdf-4``. For newer NetCDF-C releases, if ``configure`` reports that
+  ``xml2-config`` cannot be found, add ``--disable-libxml2`` to use the bundled XML
+  parser. Here, the :attr:`--prefix` determines the output directory of the build.
+  Then make and install NetCDF:
 
   .. code:: bash
 
@@ -167,10 +228,14 @@ The setup instructions are below:
   .. code:: make
 
      INC = -I<path>/include -I./
-     LDFLAGS = -L<path>/lib
-     LIBS = -lcublas -lcusolver -l:libnetcdf.a
+     LDFLAGS = -L<path>/lib -Xlinker=-rpath -Xlinker=<path>/lib
+     LIBS = -lcublas -lcusolver -lcufft -lnetcdf
 
-  where :attr:`<path>` should be replaced with the installation path for NetCDF (defined in :attr:`--prefix` of the ``./configure`` command).
+  where :attr:`<path>` should be replaced with the installation path for NetCDF
+  (defined in :attr:`--prefix` of the ``./configure`` command). The ``-L`` option
+  specifies where to find NetCDF while linking, and the ``-rpath`` linker option
+  records this location so that the shared NetCDF library can also be found when
+  running :program:`GPUMD`.
 * Follow the remaining :program:`GPUMD` installation instructions
 
 Following these steps will enable the :ref:`dump_netcdf keyword <kw_dump_netcdf>`.
@@ -680,4 +745,3 @@ References
 * jse: https://github.com/liqa1024/jse
 * jse-skill: https://github.com/liqa1024/jse-skill
 * jsex-NNAP: https://github.com/liqa1024/jsex-NNAP
-

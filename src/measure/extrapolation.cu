@@ -44,10 +44,13 @@ __global__ void gpu_calculate_max_gamma(
 
 Extrapolation::Extrapolation(const char** params, int num_params)
 {
-  property_name = "compute_extrapolation";
+  action_name = "compute_extrapolation";
   int i = 1;
   while (i < num_params) {
-    if (strcmp(params[i], "asi_file") == 0) {
+    if (strcmp(params[i], "nep_file") == 0) {
+      nep_file_name.assign(params[i + 1]);
+      i += 2;
+    } else if (strcmp(params[i], "asi_file") == 0) {
       asi_file_name.assign(params[i + 1]);
       i += 2;
     } else if (strcmp(params[i], "gamma_low") == 0) {
@@ -74,9 +77,12 @@ Extrapolation::Extrapolation(const char** params, int num_params)
       PRINT_INPUT_ERROR("Wrong input parameter!");
     }
   }
+  if (nep_file_name.empty()) {
+    PRINT_INPUT_ERROR("compute_extrapolation requires nep_file.");
+  }
 }
 
-void Extrapolation::preprocess(
+void Extrapolation::pre_run(
   const int number_of_steps,
   const double time_step,
   Integrate& integrate,
@@ -88,20 +94,12 @@ void Extrapolation::preprocess(
   int N = atom.number_of_atoms;
   printf("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
   printf("Initializing extrapolation grade calculation...\n");
-  B_size_per_atom = force.potentials[0]->B_projection_size;
-  if (B_size_per_atom == 0)
-    PRINT_INPUT_ERROR("This potential cannot be used to calculate the extrapolation grade!");
-  else
-    printf("The length of B vector for each atom: %d\n", B_size_per_atom);
-  B.resize(B_size_per_atom * N);
+  nep_extrapolation.reset(new NEP_Extrapolation(nep_file_name.c_str(), atom));
+  B_size_per_atom = nep_extrapolation->get_B_size_per_atom();
+  printf("The length of B vector for each atom: %d\n", B_size_per_atom);
   gamma_full.resize(B_size_per_atom * N);
-  // Device memory (not managed) + explicit host mirrors: WSL2 does not support host
-  // access to cudaMallocManaged buffers after device kernels run, which segfaults the
-  // original managed gamma / blas pointer arrays. See the fix note in calculate_gamma.
   gamma.resize(N);
   cpu_gamma.resize(N);
-  force.potentials[0]->B_projection = B.data();
-  force.potentials[0]->need_B_projection = true;
   this->atom = &atom;
   this->box = &box;
   f = my_fopen("extrapolation_dump.xyz", "a");
@@ -110,11 +108,11 @@ void Extrapolation::preprocess(
   blas_x.resize(N);
   blas_y.resize(N);
   cpu_blas_A.resize(N);
-  load_asi(); // fills cpu_blas_A (host) with each atom's device asi pointer
+  load_asi();
   blas_A.copy_from_host(cpu_blas_A.data());
   std::vector<double*> host_x(N), host_y(N);
   for (int i = 0; i < N; i++) {
-    host_x[i] = B.data() + i * B_size_per_atom;
+    host_x[i] = nep_extrapolation->get_B_projection() + i * B_size_per_atom;
     host_y[i] = gamma_full.data() + i * B_size_per_atom;
   }
   blas_x.copy_from_host(host_x.data());
@@ -128,7 +126,7 @@ void Extrapolation::preprocess(
   printf("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 }
 
-void Extrapolation::postprocess(
+void Extrapolation::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,
@@ -193,7 +191,7 @@ void Extrapolation::load_asi()
   }
 }
 
-void Extrapolation::process(
+void Extrapolation::end_of_step(
   const int number_of_steps,
   int step,
   const int fixed_group,
@@ -232,6 +230,7 @@ void Extrapolation::process(
 void Extrapolation::calculate_gamma()
 {
   int N = atom->number_of_atoms;
+  nep_extrapolation->compute(*box, atom->position_per_atom);
 
   double alpha = 1.0, beta = 0.0;
 
@@ -245,7 +244,7 @@ void Extrapolation::calculate_gamma()
       &alpha,
       cpu_blas_A[i],
       B_size_per_atom,
-      B.data() + i * B_size_per_atom,
+      nep_extrapolation->get_B_projection() + i * B_size_per_atom,
       1,
       &beta,
       gamma_full.data() + i * B_size_per_atom,
@@ -271,8 +270,6 @@ void Extrapolation::calculate_gamma()
   gpu_calculate_max_gamma<<<(N - 1) / 128 + 1, 128>>>(
     gamma_full.data(), gamma.data(), N, B_size_per_atom);
   gpuDeviceSynchronize();
-  // Mirror gamma to the host: process()/dump() read it on the CPU, and a managed
-  // buffer isn't host-accessible after the kernel on WSL2.
   gamma.copy_to_host(cpu_gamma.data());
 }
 

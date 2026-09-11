@@ -26,7 +26,7 @@ Calculate the stress autocorrelation function and viscosity.
 
 #define NUM_OF_COMPONENTS 9
 
-void Viscosity::preprocess(
+void Viscosity::pre_run(
   const int number_of_steps,
   const double time_step,
   Integrate& integrate,
@@ -37,6 +37,10 @@ void Viscosity::preprocess(
 {
   if (compute) {
     int number_of_frames = number_of_steps / sample_interval;
+    if (Nc > number_of_frames) {
+      PRINT_INPUT_ERROR(
+        "The number of viscosity correlation steps should not exceed the number of sampled frames.\n");
+    }
     stress_all.resize(NUM_OF_COMPONENTS * number_of_frames);
   }
 }
@@ -83,7 +87,7 @@ static __global__ void gpu_sum_stress(
   }
 }
 
-void Viscosity::process(
+void Viscosity::end_of_step(
   const int number_of_steps,
   int step,
   const int fixed_group,
@@ -195,7 +199,7 @@ find_viscosity(const int Nc, const double factor, const double* correlation, dou
   }
 }
 
-void Viscosity::postprocess(
+void Viscosity::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,
@@ -265,7 +269,7 @@ void Viscosity::postprocess(
 Viscosity::Viscosity(const char** param, int num_param)
 {
   parse(param, num_param);
-  property_name = "compute_viscosity";
+  action_name = "compute_viscosity";
 }
 
 void Viscosity::parse(const char** param, int num_param)
@@ -281,10 +285,16 @@ void Viscosity::parse(const char** param, int num_param)
   if (!is_valid_int(param[1], &sample_interval)) {
     PRINT_INPUT_ERROR("sample interval for viscosity should be an integer number.\n");
   }
+  if (sample_interval <= 0) {
+    PRINT_INPUT_ERROR("sample interval for viscosity should be positive.\n");
+  }
   printf("    sample interval is %d.\n", sample_interval);
 
   if (!is_valid_int(param[2], &Nc)) {
     PRINT_INPUT_ERROR("Nc for viscosity should be an integer number.\n");
+  }
+  if (Nc <= 0) {
+    PRINT_INPUT_ERROR("Nc for viscosity should be positive.\n");
   }
   printf("    Nc is %d\n", Nc);
 }

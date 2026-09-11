@@ -125,15 +125,7 @@ void Force::parse_potential(
     is_nep = true;
     check_types(param[1]);
   } else if (
-    strcmp(potential_name, "nep5") == 0 || strcmp(potential_name, "nep5_zbl") == 0 ||
-    strcmp(potential_name, "nep3") == 0 || strcmp(potential_name, "nep3_zbl") == 0 ||
     strcmp(potential_name, "nep4") == 0 || strcmp(potential_name, "nep4_zbl") == 0 ||
-    strcmp(potential_name, "nep3_dipole") == 0 ||
-    strcmp(potential_name, "nep3_polarizability") == 0 ||
-    strcmp(potential_name, "nep4_dipole") == 0 ||
-    strcmp(potential_name, "nep4_polarizability") == 0 ||
-    strcmp(potential_name, "nep3_temperature") == 0 ||
-    strcmp(potential_name, "nep3_zbl_temperature") == 0 ||
     strcmp(potential_name, "nep4_temperature") == 0 ||
     strcmp(potential_name, "nep4_zbl_temperature") == 0) {
     int num_gpus;
@@ -344,6 +336,9 @@ void Force::set_hnemd_parameters(
   if (compute_hnemd_ || compute_hnemdec_ >= 0) {
     PRINT_INPUT_ERROR("Cannot have more than one HNEMD method within one run.");
   }
+  if (hnemd_force_sum_.size() != 3) {
+    hnemd_force_sum_.resize(3);
+  }
   compute_hnemd_ = true;
   hnemd_fe_[0] = hnemd_fe_x;
   hnemd_fe_[1] = hnemd_fe_y;
@@ -389,6 +384,13 @@ void Force::set_hnemdec_parameters(
   if (compute_hnemdec_ == 0) {
     cpu_coefficient.resize(number_of_types * 2);
     coefficient.resize(number_of_types * 2);
+    const size_t tensor_size = static_cast<size_t>(N) * 9;
+    if (hnemdec_tensor_per_atom_.size() != tensor_size) {
+      hnemdec_tensor_per_atom_.resize(tensor_size);
+    }
+    if (hnemdec_tensor_sum_.size() != 9) {
+      hnemdec_tensor_sum_.resize(9);
+    }
 
     for (int i = 0; i < number_of_types; i++) {
       double c_hv = (total_mass - N * mass_type[i]) / total_mass;
@@ -421,7 +423,8 @@ void Force::set_hnemdec_parameters(
   hnemd_fe_[2] = hnemd_fe_z;
 }
 
-static __global__ void gpu_apply_pbc(int N, Box box, double* g_x, double* g_y, double* g_z)
+static __global__ void gpu_apply_pbc(
+  int N, Box box, double* g_x, double* g_y, double* g_z, int* g_position_image)
 {
   int n = blockIdx.x * blockDim.x + threadIdx.x;
   if (n < N) {
@@ -434,22 +437,34 @@ static __global__ void gpu_apply_pbc(int N, Box box, double* g_x, double* g_y, d
     if (box.pbc_x == 1) {
       if (sx < 0.0) {
         sx += 1.0;
+        if (g_position_image != nullptr)
+          g_position_image[n]--;
       } else if (sx > 1.0) {
         sx -= 1.0;
+        if (g_position_image != nullptr)
+          g_position_image[n]++;
       }
     }
     if (box.pbc_y == 1) {
       if (sy < 0.0) {
         sy += 1.0;
+        if (g_position_image != nullptr)
+          g_position_image[n + N]--;
       } else if (sy > 1.0) {
         sy -= 1.0;
+        if (g_position_image != nullptr)
+          g_position_image[n + N]++;
       }
     }
     if (box.pbc_z == 1) {
       if (sz < 0.0) {
         sz += 1.0;
+        if (g_position_image != nullptr)
+          g_position_image[n + N * 2]--;
       } else if (sz > 1.0) {
         sz -= 1.0;
+        if (g_position_image != nullptr)
+          g_position_image[n + N * 2]++;
       }
     }
     g_x[n] = box.cpu_h[0] * sx + box.cpu_h[1] * sy + box.cpu_h[2] * sz;
@@ -499,7 +514,8 @@ void Force::compute(
       box,
       position_per_atom.data(),
       position_per_atom.data() + number_of_atoms,
-      position_per_atom.data() + number_of_atoms * 2);
+      position_per_atom.data() + number_of_atoms * 2,
+      nullptr);
   }
 
   initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
@@ -587,14 +603,12 @@ void Force::compute(
       force_per_atom.data() + number_of_atoms,
       force_per_atom.data() + 2 * number_of_atoms);
 
-    GPU_Vector<double> ftot(3); // total force vector of the system
-
     gpu_sum_force<<<3, 1024>>>(
       number_of_atoms,
       force_per_atom.data(),
       force_per_atom.data() + number_of_atoms,
       force_per_atom.data() + 2 * number_of_atoms,
-      ftot.data());
+      hnemd_force_sum_.data());
     GPU_CHECK_KERNEL
 
     gpu_correct_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
@@ -603,7 +617,7 @@ void Force::compute(
       force_per_atom.data(),
       force_per_atom.data() + number_of_atoms,
       force_per_atom.data() + 2 * number_of_atoms,
-      ftot.data());
+      hnemd_force_sum_.data());
     GPU_CHECK_KERNEL
   }
 
@@ -777,7 +791,8 @@ void Force::compute(
   GPU_Vector<double>& force_per_atom,
   GPU_Vector<double>& virial_per_atom,
   GPU_Vector<double>& velocity_per_atom,
-  GPU_Vector<double>& mass_per_atom)
+  GPU_Vector<double>& mass_per_atom,
+  int* position_image)
 {
   box.set_is_orthogonal();
 
@@ -788,7 +803,8 @@ void Force::compute(
       box,
       position_per_atom.data(),
       position_per_atom.data() + number_of_atoms,
-      position_per_atom.data() + number_of_atoms * 2);
+      position_per_atom.data() + number_of_atoms * 2,
+      position_image);
   }
 
   initialize_properties<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
@@ -800,7 +816,6 @@ void Force::compute(
     virial_per_atom.data());
   GPU_CHECK_KERNEL
 
-  temperature += delta_T;
   if (multiple_potentials_mode_.compare("observe") == 0) {
     // If observing, calculate using main potential only
     if (3 == potentials[0]->nep_model_type) {
@@ -877,14 +892,12 @@ void Force::compute(
       force_per_atom.data() + number_of_atoms,
       force_per_atom.data() + 2 * number_of_atoms);
 
-    GPU_Vector<double> ftot(3); // total force vector of the system
-
     gpu_sum_force<<<3, 1024>>>(
       number_of_atoms,
       force_per_atom.data(),
       force_per_atom.data() + number_of_atoms,
       force_per_atom.data() + 2 * number_of_atoms,
-      ftot.data());
+      hnemd_force_sum_.data());
     GPU_CHECK_KERNEL
 
     gpu_correct_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
@@ -893,16 +906,13 @@ void Force::compute(
       force_per_atom.data(),
       force_per_atom.data() + number_of_atoms,
       force_per_atom.data() + 2 * number_of_atoms,
-      ftot.data());
+      hnemd_force_sum_.data());
     GPU_CHECK_KERNEL
   } else if (compute_hnemdec_ == 0) {
     // the tensor:
     // xx xy xz    0 3 4
     // yx yy yz    6 1 5
     // zx zy zz    7 8 2
-    GPU_Vector<double> tensor_per_atom(number_of_atoms * 9);
-    GPU_Vector<double> tensor_tot(9);
-
     gpu_find_per_atom_tensor<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
       number_of_atoms,
       mass_per_atom.data(),
@@ -919,10 +929,11 @@ void Force::compute(
       virial_per_atom.data() + 7 * number_of_atoms,
       virial_per_atom.data() + 8 * number_of_atoms,
       virial_per_atom.data() + 2 * number_of_atoms,
-      tensor_per_atom.data());
+      hnemdec_tensor_per_atom_.data());
     GPU_CHECK_KERNEL
 
-    gpu_sum_tensor<<<9, 1024>>>(number_of_atoms, tensor_per_atom.data(), tensor_tot.data());
+    gpu_sum_tensor<<<9, 1024>>>(
+      number_of_atoms, hnemdec_tensor_per_atom_.data(), hnemdec_tensor_sum_.data());
     GPU_CHECK_KERNEL
 
     gpu_add_driving_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
@@ -932,16 +943,16 @@ void Force::compute(
       hnemd_fe_[0],
       hnemd_fe_[1],
       hnemd_fe_[2],
-      tensor_per_atom.data() + 0 * number_of_atoms,
-      tensor_per_atom.data() + 3 * number_of_atoms,
-      tensor_per_atom.data() + 4 * number_of_atoms,
-      tensor_per_atom.data() + 6 * number_of_atoms,
-      tensor_per_atom.data() + 1 * number_of_atoms,
-      tensor_per_atom.data() + 5 * number_of_atoms,
-      tensor_per_atom.data() + 7 * number_of_atoms,
-      tensor_per_atom.data() + 8 * number_of_atoms,
-      tensor_per_atom.data() + 2 * number_of_atoms,
-      tensor_tot.data(),
+      hnemdec_tensor_per_atom_.data() + 0 * number_of_atoms,
+      hnemdec_tensor_per_atom_.data() + 3 * number_of_atoms,
+      hnemdec_tensor_per_atom_.data() + 4 * number_of_atoms,
+      hnemdec_tensor_per_atom_.data() + 6 * number_of_atoms,
+      hnemdec_tensor_per_atom_.data() + 1 * number_of_atoms,
+      hnemdec_tensor_per_atom_.data() + 5 * number_of_atoms,
+      hnemdec_tensor_per_atom_.data() + 7 * number_of_atoms,
+      hnemdec_tensor_per_atom_.data() + 8 * number_of_atoms,
+      hnemdec_tensor_per_atom_.data() + 2 * number_of_atoms,
+      hnemdec_tensor_sum_.data(),
       force_per_atom.data(),
       force_per_atom.data() + number_of_atoms,
       force_per_atom.data() + 2 * number_of_atoms);

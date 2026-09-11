@@ -129,7 +129,7 @@ __global__ void gpu_find_vac(
 
 } // namespace
 
-void SDC::preprocess(
+void SDC::pre_run(
   const int number_of_steps,
   const double time_step,
   Integrate& integrate,
@@ -140,6 +140,11 @@ void SDC::preprocess(
 {
   if (!compute_)
     return;
+
+  if (num_correlation_steps_ > number_of_steps / sample_interval_) {
+    PRINT_INPUT_ERROR(
+      "The number of SDC correlation steps should not exceed the number of sampled frames.\n");
+  }
 
   num_atoms_ = (grouping_method_ < 0) ? atom.number_of_atoms : groups[grouping_method_].cpu_size[group_id_];
   dt_in_natural_units_ = time_step * sample_interval_;
@@ -154,7 +159,7 @@ void SDC::preprocess(
   num_time_origins_ = 0;
 }
 
-void SDC::process(
+void SDC::end_of_step(
   const int number_of_steps,
   int step,
   const int fixed_group,
@@ -223,7 +228,7 @@ void SDC::process(
   }
 }
 
-void SDC::postprocess(
+void SDC::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,
@@ -294,7 +299,7 @@ void SDC::postprocess(
 SDC::SDC(const char** param, const int num_param, const std::vector<Group>& groups)
 {
   parse(param, num_param, groups);
-  property_name = "compute_sdc";
+  action_name = "compute_sdc";
 }
 
 void SDC::parse(const char** param, const int num_param, const std::vector<Group>& groups)

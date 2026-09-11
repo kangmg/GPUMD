@@ -26,6 +26,7 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
+#include "utilities/nep_parameters.cuh"
 #include "utilities/nep_utilities.cuh"
 #include <chrono>
 #include <cmath>
@@ -53,7 +54,7 @@ void NEP_Charge::check_ewald_pppm()
   use_pppm = true;
   std::string line;
   while (std::getline(input_run, line)) {
-    std::vector<std::string> tokens = get_tokens(line);
+    std::vector<std::string> tokens = get_tokens_without_comments(line);
     if (tokens.size() != 0) {
       if (tokens[0] == "kspace") {
         if (tokens.size() != 2) {
@@ -76,6 +77,50 @@ void NEP_Charge::check_ewald_pppm()
   input_run.close();
 }
 
+void NEP_Charge::check_need_bec()
+{
+  need_bec = false;
+  std::ifstream input_run("run.in");
+  if (!input_run.is_open()) {
+    PRINT_INPUT_ERROR("Cannot open run.in.");
+  }
+
+  std::string line;
+  while (std::getline(input_run, line)) {
+    std::vector<std::string> tokens = get_tokens_without_comments(line);
+
+    if (tokens.size() != 0) {
+      if (tokens[0] == "compute_dpdt") {
+        need_bec = true;
+        break;
+      }
+
+      if (tokens[0] == "dump_xyz" || tokens[0] == "dump_netcdf") {
+        for (int n = 3; n < tokens.size(); ++n) {
+          if (tokens[n] == "bec") {
+            need_bec = true;
+            break;
+          }
+        }
+        if (need_bec) {
+          break;
+        }
+      }
+
+      if (tokens[0] == "add_efield") {
+        if (
+          tokens.size() == 4 || tokens.size() == 6 ||
+          ((tokens.size() == 5 || tokens.size() == 7) && tokens.back() == "bec")) {
+          need_bec = true;
+          break;
+        }
+      }
+    }
+  }
+
+  input_run.close();
+}
+
 void NEP_Charge::initialize_dftd3()
 {
   std::ifstream input_run("run.in");
@@ -86,7 +131,7 @@ void NEP_Charge::initialize_dftd3()
   has_dftd3 = false;
   std::string line;
   while (std::getline(input_run, line)) {
-    std::vector<std::string> tokens = get_tokens(line);
+    std::vector<std::string> tokens = get_tokens_without_comments(line);
     if (tokens.size() != 0) {
       if (tokens[0] == "dftd3") {
         has_dftd3 = true;
@@ -325,9 +370,20 @@ NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
     tokens = get_tokens(input);
     parameters[n] = get_double_from_token(tokens[0], __FILE__, __LINE__);
   }
+  std::vector<float> descriptor_parameters = get_descriptor_parameters_type_pair(
+    parameters,
+    annmb.num_para_ann,
+    paramb.num_types,
+    paramb.n_max_radial,
+    paramb.n_max_angular,
+    paramb.basis_size_radial,
+    paramb.basis_size_angular);
   nep_data.parameters.resize(annmb.num_para + annmb.dim);
   nep_data.parameters.copy_from_host(parameters.data());
+  nep_data.descriptor_parameters_type_pair.resize(num_para_descriptor);
+  nep_data.descriptor_parameters_type_pair.copy_from_host(descriptor_parameters.data());
   update_potential(nep_data.parameters.data(), annmb);
+  annmb.c_type_pair = nep_data.descriptor_parameters_type_pair.data();
   annmb.q_scaler = nep_data.parameters.data() + annmb.num_para;
 
   // flexible zbl potential parameters
@@ -343,6 +399,7 @@ NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
   // charge related parameters and data
   charge_para.alpha = float(PI) / paramb.rc_radial; // a good value
   check_ewald_pppm();
+  check_need_bec();
   if (use_pppm) {
     pppm.initialize(charge_para.alpha);
   } else {
@@ -355,7 +412,9 @@ NEP_Charge::NEP_Charge(const char* file_potential, const int num_atoms)
   nep_data.D_real.resize(num_atoms);
   nep_data.charge.resize(num_atoms);
   nep_data.charge_derivative.resize(num_atoms * annmb.dim);
-  nep_data.bec.resize(num_atoms * 9);
+  if (need_bec) {
+    nep_data.bec.resize(num_atoms * 9);
+  }
 
   nep_data.f12x.resize(num_atoms * paramb.MN_angular);
   nep_data.f12y.resize(num_atoms * paramb.MN_angular);
@@ -498,9 +557,9 @@ static __global__ void find_descriptor(
       for (int n = 0; n <= paramb.n_max_radial; ++n) {
         float gn12 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_radial; ++k) {
-          int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2;
-          gn12 += fn12[k] * annmb.c[c_index];
+          int c_index = get_c_index(
+            t1 * paramb.num_types + t2, n, k, paramb.n_max_radial, paramb.basis_size_radial);
+          gn12 += fn12[k] * annmb.c_type_pair[c_index];
         }
         q[n] += gn12;
       }
@@ -525,9 +584,14 @@ static __global__ void find_descriptor(
         find_fn(paramb.basis_size_angular, rcinv, d12, fc12, fn12);
         float gn12 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_angular; ++k) {
-          int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
-          gn12 += fn12[k] * annmb.c[c_index];
+          int c_index = get_c_index(
+            t1 * paramb.num_types + t2,
+            n,
+            k,
+            paramb.n_max_angular,
+            paramb.basis_size_angular,
+            paramb.num_c_radial);
+          gn12 += fn12[k] * annmb.c_type_pair[c_index];
         }
         accumulate_s(paramb.L_max, d12, x12, y12, z12, gn12, s);
       }
@@ -696,9 +760,9 @@ static __global__ void find_bec_radial(
       for (int n = 0; n <= paramb.n_max_radial; ++n) {
         float gnp12 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_radial; ++k) {
-          int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2;
-          gnp12 += fnp12[k] * annmb.c[c_index];
+          int c_index = get_c_index(
+            t1 * paramb.num_types + t2, n, k, paramb.n_max_radial, paramb.basis_size_radial);
+          gnp12 += fnp12[k] * annmb.c_type_pair[c_index];
         }
         const float tmp12 = g_charge_derivative[n1 + n * N] * gnp12 * d12inv;
         for (int d = 0; d < 3; ++d) {
@@ -796,10 +860,15 @@ static __global__ void find_bec_angular(
         float gn12 = 0.0f;
         float gnp12 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_angular; ++k) {
-          int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
-          gn12 += fn12[k] * annmb.c[c_index];
-          gnp12 += fnp12[k] * annmb.c[c_index];
+          int c_index = get_c_index(
+            t1 * paramb.num_types + t2,
+            n,
+            k,
+            paramb.n_max_angular,
+            paramb.basis_size_angular,
+            paramb.num_c_radial);
+          gn12 += fn12[k] * annmb.c_type_pair[c_index];
+          gnp12 += fnp12[k] * annmb.c_type_pair[c_index];
         }
         accumulate_f12(
           paramb.L_max,
@@ -921,9 +990,12 @@ static __global__ void find_force_radial(
         float gnp12 = 0.0f;
         float gnp21 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_radial; ++k) {
-          int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
-          gnp12 += fnp12[k] * annmb.c[c_index + t1 * paramb.num_types + t2];
-          gnp21 += fnp12[k] * annmb.c[c_index + t2 * paramb.num_types + t1];
+          int c_index_12 = get_c_index(
+            t1 * paramb.num_types + t2, n, k, paramb.n_max_radial, paramb.basis_size_radial);
+          int c_index_21 = get_c_index(
+            t2 * paramb.num_types + t1, n, k, paramb.n_max_radial, paramb.basis_size_radial);
+          gnp12 += fnp12[k] * annmb.c_type_pair[c_index_12];
+          gnp21 += fnp12[k] * annmb.c_type_pair[c_index_21];
         }
         float tmp12 = g_Fp[n1 + n * N] + g_charge_derivative[n1 + n * N] * g_D_real[n1];
         float tmp21 = g_Fp[n2 + n * N] + g_charge_derivative[n2 + n * N] * g_D_real[n2];
@@ -1031,10 +1103,15 @@ static __global__ void find_partial_force_angular(
         float gn12 = 0.0f;
         float gnp12 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_angular; ++k) {
-          int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
-          gn12 += fn12[k] * annmb.c[c_index];
-          gnp12 += fnp12[k] * annmb.c[c_index];
+          int c_index = get_c_index(
+            t1 * paramb.num_types + t2,
+            n,
+            k,
+            paramb.n_max_angular,
+            paramb.basis_size_angular,
+            paramb.num_c_radial);
+          gn12 += fn12[k] * annmb.c_type_pair[c_index];
+          gnp12 += fnp12[k] * annmb.c_type_pair[c_index];
         }
         accumulate_f12(
           paramb.L_max,
@@ -1347,7 +1424,7 @@ void NEP_Charge::compute_large_box(
   zero_total_charge<<<1, 1024>>>(N, nep_data.charge.data());
   GPU_CHECK_KERNEL
 
-  if (true) { // TODO
+  if (need_bec) {
     // get BEC (the diagonal part)
     find_bec_diagonal<<<grid_size, BLOCK_SIZE>>>(
       N,
@@ -1503,7 +1580,6 @@ void NEP_Charge::compute_large_box(
     nep_data.f12x.data(),
     nep_data.f12y.data(),
     nep_data.f12z.data(),
-    false,
     position_per_atom,
     force_per_atom,
     virial_per_atom);
@@ -1621,10 +1697,10 @@ void NEP_Charge::compute_small_box(
   GPU_CHECK_KERNEL
 
   // enforce charge neutrality
-  zero_total_charge<<<N, 1024>>>(N, nep_data.charge.data());
+  zero_total_charge<<<1, 1024>>>(N, nep_data.charge.data());
   GPU_CHECK_KERNEL
 
-  if (true) { // TODO
+  if (need_bec) {
     // get BEC (the diagonal part)
     find_bec_diagonal<<<grid_size, BLOCK_SIZE>>>(
       N,

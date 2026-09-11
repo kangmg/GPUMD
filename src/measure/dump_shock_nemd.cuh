@@ -14,7 +14,7 @@
 */
 
 #pragma once
-#include "property.cuh"
+#include "action.cuh"
 #include "model/atom.cuh"
 #include "model/box.cuh"
 #include "utilities/common.cuh"
@@ -23,12 +23,12 @@
 #include <string>
 #include <vector>
 
-class Dump_Shock_NEMD : public Property
+class Dump_Shock_NEMD : public Action
 {
 public:
   Dump_Shock_NEMD(const char** param, int num_param);
   void parse(const char** param, int num_param);
-  virtual void preprocess(
+  virtual void pre_run(
     const int number_of_steps,
     const double time_step,
     Integrate& integrate,
@@ -37,7 +37,7 @@ public:
     Box& box,
     Force& force);
 
-  virtual void process(
+  virtual void end_of_step(
       const int number_of_steps,
       int step,
       const int fixed_group,
@@ -51,7 +51,7 @@ public:
       Atom& atom,
       Force& force);
 
-  virtual void postprocess(
+  virtual void post_run(
     Atom& atom,
     Box& box,
     Integrate& integrate,
@@ -66,10 +66,9 @@ private:
   int direction = 0;
   int bins;
   double slice_vol = 1;
-  double avg_window = 10;
+  double bin_size_ = 10.0;
   FILE *temp_file, *pxx_file, *pyy_file, *pzz_file, *density_file, *com_vx_file;
   GPU_Vector<double> gpu_temp, gpu_pxx, gpu_pyy, gpu_pzz, gpu_density, gpu_com_vx, gpu_com_vy,
     gpu_com_vz, gpu_number;
-  std::vector<double> cpu_temp, cpu_pxx, cpu_pyy, cpu_pzz, cpu_density, cpu_com_vx, cpu_com_vy,
-    cpu_com_vz;
+  std::vector<double> cpu_temp, cpu_pxx, cpu_pyy, cpu_pzz, cpu_density, cpu_com_vx;
 };

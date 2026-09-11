@@ -31,7 +31,7 @@ Dump a restart file
 Dump_Restart::Dump_Restart(const char** param, int num_param)
 {
   parse(param, num_param);
-  property_name = "dump_restart";
+  action_name = "dump_restart";
 }
 
 void Dump_Restart::parse(const char** param, int num_param)
@@ -49,7 +49,7 @@ void Dump_Restart::parse(const char** param, int num_param)
   printf("Dump restart every %d steps.\n", dump_interval_);
 }
 
-void Dump_Restart::preprocess(
+void Dump_Restart::pre_run(
   const int number_of_steps,
   const double time_step,
   Integrate& integrate,
@@ -63,7 +63,7 @@ void Dump_Restart::preprocess(
   }
 }
 
-void Dump_Restart::process(
+void Dump_Restart::end_of_step(
   const int number_of_steps,
   int step,
   const int fixed_group,
@@ -96,7 +96,7 @@ void Dump_Restart::process(
 
   fprintf(
     fid,
-    "Lattice=\"%g %g %g %g %g %g %g %g %g\" ",
+    "Lattice=\"%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\" ",
     box.cpu_h[0],
     box.cpu_h[3],
     box.cpu_h[6],
@@ -117,7 +117,7 @@ void Dump_Restart::process(
     const double natural_to_A_per_fs = 1.0 / TIME_UNIT_CONVERSION;
     fprintf(
       fid,
-      "%s %g %g %g %g %g %g %g ",
+      "%s %.17g %.17g %.17g %.17g %.17g %.17g %.17g ",
       atom.cpu_atom_symbol[n].c_str(),
       atom.cpu_position_per_atom[n],
       atom.cpu_position_per_atom[n + number_of_atoms],
@@ -138,7 +138,7 @@ void Dump_Restart::process(
   fclose(fid);
 }
 
-void Dump_Restart::postprocess(
+void Dump_Restart::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,

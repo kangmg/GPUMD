@@ -30,7 +30,7 @@ Calculate the heat current autocorrelation (HAC) function.
 #define DIM 3
 
 // Allocate memory for recording heat current data
-void HAC::preprocess(
+void HAC::pre_run(
   const int number_of_steps,
   const double time_step,
   Integrate& integrate,
@@ -41,6 +41,10 @@ void HAC::preprocess(
 {
   if (compute) {
     int number_of_frames = number_of_steps / sample_interval;
+    if (Nc > number_of_frames) {
+      PRINT_INPUT_ERROR(
+        "The number of HAC correlation steps should not exceed the number of sampled frames.\n");
+    }
     heat_all.resize(NUM_OF_HEAT_COMPONENTS * number_of_frames);
     atom.heat_per_atom.resize(atom.number_of_atoms * 5);
   }
@@ -78,7 +82,7 @@ gpu_sum_heat(const int N, const int Nd, const int nd, const double* g_heat, doub
 }
 
 // sample heat current data for HAC calculations.
-void HAC::process(
+void HAC::end_of_step(
   const int number_of_steps,
   int step,
   const int fixed_group,
@@ -179,7 +183,7 @@ static void find_rtc(const int Nc, const double factor, const double* hac, doubl
 
 // Calculate HAC (heat currant auto-correlation function)
 // and RTC (running thermal conductivity)
-void HAC::postprocess(
+void HAC::post_run(
   Atom& atom,
   Box& box,
   Integrate& integrate,
@@ -260,15 +264,24 @@ void HAC::parse(const char** param, int num_param)
   if (!is_valid_int(param[1], &sample_interval)) {
     PRINT_INPUT_ERROR("sample interval for HAC should be an integer number.\n");
   }
+  if (sample_interval <= 0) {
+    PRINT_INPUT_ERROR("sample interval for HAC should be positive.\n");
+  }
   printf("    sample interval is %d.\n", sample_interval);
 
   if (!is_valid_int(param[2], &Nc)) {
     PRINT_INPUT_ERROR("Nc for HAC should be an integer number.\n");
   }
+  if (Nc <= 0) {
+    PRINT_INPUT_ERROR("Nc for HAC should be positive.\n");
+  }
   printf("    Nc is %d\n", Nc);
 
   if (!is_valid_int(param[3], &output_interval)) {
     PRINT_INPUT_ERROR("output_interval for HAC should be an integer number.\n");
+  }
+  if (output_interval <= 0) {
+    PRINT_INPUT_ERROR("output_interval for HAC should be positive.\n");
   }
   printf("    output_interval is %d\n", output_interval);
 }
@@ -276,5 +289,5 @@ void HAC::parse(const char** param, int num_param)
 HAC::HAC(const char** param, int num_param)
 {
   parse(param, num_param);
-  property_name = "compute_hac";
+  action_name = "compute_hac";
 }

@@ -20,7 +20,7 @@ class Ensemble_NHC : public Ensemble
 {
 public:
   Ensemble_NHC(int, int, double*, int, double, double, double);
-  Ensemble_NHC(int, int, int, int, int, double, double, double, double);
+  Ensemble_NHC(int, int, int, int, int, int, double, double, double, double);
   virtual ~Ensemble_NHC(void);
 
   virtual void compute1(
@@ -71,6 +71,22 @@ protected:
     GPU_Vector<double>& velocity_per_atom);
 
   void integrate_heat_nhc_2(
+    const double time_step,
+    const std::vector<Group>& group,
+    const GPU_Vector<double>& mass,
+    const GPU_Vector<double>& force_per_atom,
+    GPU_Vector<double>& position_per_atom,
+    GPU_Vector<double>& velocity_per_atom);
+
+  void integrate_heat_nhc_power_1(
+    const double time_step,
+    const std::vector<Group>& group,
+    const GPU_Vector<double>& mass,
+    const GPU_Vector<double>& force_per_atom,
+    GPU_Vector<double>& position_per_atom,
+    GPU_Vector<double>& velocity_per_atom);
+
+  void integrate_heat_nhc_power_2(
     const double time_step,
     const std::vector<Group>& group,
     const GPU_Vector<double>& mass,
