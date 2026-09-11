@@ -7,7 +7,10 @@ Ported patch: local `a0cb5679bf7e56bb0a0f449be7fbe1d59bfba93d`.
 The original checkout, `master`, installed symlink and binary remain unchanged.
 Original binary SHA256:
 `1b01bd22e75f0cad335f1ecf124a5e3772cfe952d03f79ffaef88c75dbef9683`.
-The separate `add-torchnep` worktree is not included or modified.
+The separate `add-torchnep` worktree is not modified. The integration branch now
+also merges fork master `6d4cd057f7a22cfb07739afd46947fa53387b08b`, preserving
+its complete `torchnep/` tree, including early stopping. The extrapolation
+conflicts retain the already-built upstream-compatible WSL2 implementation.
 
 ## Patch
 
@@ -51,4 +54,4 @@ Do not replace the installed binary before adapting and testing nepstill:
 
 The existing calls in nepstill's `active_learning/gpumd_protocol.py` still use
 the old syntax. They have deliberately not been changed in this GPUMD-only port.
-No build of `nep`/`gnep`, multi-GPU training, or TorchNEP integration is claimed.
+No build of `nep`/`gnep`, multi-GPU training, or TorchNEP runtime qualification is claimed.

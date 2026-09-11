@@ -165,6 +165,9 @@ void Extrapolation::load_asi()
         type_of_atom,
         shape1,
         shape2);
+      // Device (global) memory, not managed: cuBLAS reads this matrix directly, and
+      // reading a cudaMallocManaged buffer from cuBLAS segfaults on WSL2 (incomplete
+      // unified-memory support). Read into a host buffer, then copy to the device.
       asi_list.emplace_back(
         std::unique_ptr<GPU_Vector<double>>(new GPU_Vector<double>(B_size)));
       auto& asi = asi_list.back();
