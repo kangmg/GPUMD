@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 Data-sharded distributed NEP training.
@@ -41,8 +41,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.swa_utils import AveragedModel
 
 import torch.nn as nn
-from .model import NEPModel
-from .data import read_xyz, parse_nep_in
+from .model import NEPModel, gpumd_init_parameters
+from .data import (read_xyz, parse_nep_in, valid_split_indices,
+                   stratified_split_indices)
 from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded
@@ -67,6 +68,13 @@ def _register_pg_atexit():
 
     def _cleanup():
         if dist.is_available() and dist.is_initialized():
+            # Rendezvous before tearing down: rank 0 hosts the TCPStore, and
+            # if it exits first the other ranks' NCCL heartbeat monitors spam
+            # "failed to recv" warnings while polling the dead store.
+            try:
+                dist.barrier()
+            except Exception:
+                pass
             dist.destroy_process_group()
 
     atexit.register(_cleanup)
@@ -85,7 +93,8 @@ class _NEPDDPShim(nn.Module):
     this shim's ``forward`` puts it on the DDP path.
     """
 
-    def __init__(self, model: NEPModel, use_compile: bool = False):
+    def __init__(self, model: NEPModel, use_compile: bool = False,
+                 use_autograd_forces: bool = False):
         super().__init__()
         self.model = model
         # torch.compile is applied to the bound analytical compute method, not
@@ -93,20 +102,35 @@ class _NEPDDPShim(nn.Module):
         # NOT in NEPModel.forward(), so compiling the module would be a no-op.
         # The compiled call stays INSIDE this shim's forward, so it remains on
         # DDP's forward path and the reducer still arms backward all-reduce; the
-        # compiled region does not span the DDP boundary. The autograd path is
-        # left eager (its create_graph=True double backward is incompatible with
-        # torch.compile's donated-buffer optimisation). See train.py for the
-        # single-device counterpart.
+        # compiled region does not span the DDP boundary.
+        self._ag_compute = None
         if use_compile and hasattr(torch, "compile"):
-            self._compute_cached = torch.compile(
-                model.compute_properties_cached, dynamic=True)
-        else:
+            if use_autograd_forces:
+                # make_fx-traced autograd forces (see compiled_autograd):
+                # parameters enter the traced graph as function inputs, so
+                # loss.backward() still fills the same nn.Parameter .grads
+                # that DDP's reducer hooks watch — every parameter appears
+                # in the graph (weight stacks touch all types), so no
+                # find_unused_parameters needed.
+                from .compiled_autograd import CompiledAutogradForce
+                self._ag_compute = CompiledAutogradForce(model)
+            else:
+                # Compile the branch-free core; result assembly stays eager
+                # in the wrapper (see NEPModel._cached_core).
+                import functools
+                self._compute_cached = functools.partial(
+                    model.compute_properties_cached,
+                    core_fn=torch.compile(model._cached_core, dynamic=True))
+        if not hasattr(self, "_compute_cached"):
             self._compute_cached = model.compute_properties_cached
 
     def forward(self, batch, use_autograd_forces: bool,
                 need_forces: bool, need_virial: bool, backend: str):
         if use_autograd_forces:
-            return self.model.compute_properties(
+            fn = (self._ag_compute.compute_properties
+                  if self._ag_compute is not None
+                  else self.model.compute_properties)
+            return fn(
                 batch["rij_rad"], batch["rij_ang"],
                 batch["pair_i_rad"], batch["pair_j_rad"],
                 batch["pair_i_ang"], batch["pair_j_ang"],
@@ -120,14 +144,15 @@ class _NEPDDPShim(nn.Module):
 
 from .train import (
     _BANNER, _AUTHOR,
-    _backend_info, GPUDataStore,
+    _backend_info, StreamDataStore, iter_collated,
     format_config_summary,
-    preprocess_structures,
+    preprocess_structures, compute_max_neighbors,
+    choose_neighbor_mode, NEIGHBOR_MODES, _fmt_gb,
     _save_checkpoint, _load_checkpoint,
     _trim_loss_log, _accumulate_true_loss_sums,
-    _make_lr_scheduler, _scheduler_step,
+    _make_optimizer, _make_lr_scheduler, _scheduler_step,
     _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
-    _clean_warning_format, _VIRIAL_6,
+    _clean_warning_format, _default_alloc_conf, _VIRIAL_6,
 )
 
 
@@ -199,20 +224,25 @@ def train_nep_sharded(
     data_file: str,
     output_dir: str = ".",
     precision: str = "float32",
-    backend: str = "auto",
     use_autograd_forces: bool = False,
     use_swa: bool = False,
-    use_compile: bool = False,
-    print_interval: int = 10,
+    swa_start: int = None,
+    use_compile: bool = None,
+    print_interval: int = 1,
     restart: bool = True,
     checkpoint_interval: int = 100,
-    prediction_interval: int = 20,
+    prediction_interval: int = 100,
     finetune_from: str = None,
     resume_from: str = None,
     recompute_q_scaler: bool = False,
     slim_types: bool = False,
     energy_key: str = "energy",
-    use_gpumd_qscaler: bool = True,
+    use_gpumd_qscaler: bool = False,
+    run_seed: int = None,
+    valid_file: str = None,
+    valid_ratio: float = None,
+    valid_strategy: str = "stratified",
+    neighbor_mode: str = "auto",
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -234,14 +264,36 @@ def train_nep_sharded(
     ``recompute_q_scaler=True``). Runtime-exclusive differences are the DDP
     launch, CUDA/gloo backend auto-select, and distributed aggregation of
     q_scaler / epoch metrics / the frozen-weight best evaluation.
+
+    ``run_seed`` mirrors ``train_nep``: None -> a fresh random seed each run
+    (rank 0 draws it and broadcasts, so all replicas agree); pass an int for a
+    fully reproducible run. It seeds the weight init and the per-epoch shuffle,
+    and is saved into / restored from the checkpoint for exact resumption.
+
+    ``valid_file`` / ``valid_ratio`` mirror ``train_nep``: a validation set
+    (own .xyz, or a run_seed-drawn holdout fraction of data_file) evaluated
+    every epoch — nep_best and the plateau LR schedule then follow the
+    validation loss. The validation frames are sharded across ranks like the
+    training frames; the error sums are all-reduced, so every rank sees the
+    identical validation loss (schedulers stay in lock-step).
+
+    Each rank keeps its shard in host memory and streams only the current
+    batch to its GPU (basis computed on the fly, CPU assembly prefetched
+    one batch ahead) — per-GPU memory scales with ``batch``, not shard
+    size. DDP collectives are untouched: same step count per rank,
+    gradients all-reduced as usual.
     """
     _clean_warning_format()
+    _default_alloc_conf()
+    # Quiet CPU-thread oversubscription for multi-process runs (torchrun
+    # sets this itself and warns when unset; other launchers may not).
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
 
     # ---- Distributed init ------------------------------------------------
     # Wrap local_rank around the number of visible GPUs — lets several
     # processes share one GPU (useful for locally simulating multi-rank DDP).
     # NCCL refuses to share a GPU across ranks, so fall back to gloo (slower
-    # but correct) when world_size > available GPUs.
+    # but correct) when the ranks on this node outnumber its GPUs.
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     cuda_available = torch.cuda.is_available()
     n_gpus = torch.cuda.device_count() if cuda_available else 0
@@ -254,12 +306,30 @@ def train_nep_sharded(
         dev = torch.device("cpu")
     if not dist.is_initialized():
         world_size_env = int(os.environ.get("WORLD_SIZE", 1))
-        ddp_backend = "nccl" if cuda_available and world_size_env <= n_gpus else "gloo"
+        # GPU sharing is a per-NODE question: on a multi-node run each node
+        # hosts LOCAL_WORLD_SIZE ranks (torchrun sets it; srun-style
+        # launchers expose SLURM_NTASKS_PER_NODE), and NCCL is fine as long
+        # as no two ranks on one node share a GPU. Comparing the GLOBAL
+        # world size against the local GPU count (the old heuristic) forced
+        # every multi-node run onto gloo.
+        local_world_env = int(
+            os.environ.get("LOCAL_WORLD_SIZE",
+                           os.environ.get("SLURM_NTASKS_PER_NODE",
+                                          world_size_env)))
+        ddp_backend = ("nccl" if cuda_available and local_world_env <= n_gpus
+                       else "gloo")
         # Pass device_id so NCCL can bind the rank to its CUDA device
         # deterministically (silences "Guessing device ID based on global
         # rank" and the collective-context warnings, and prevents hangs on
         # heterogeneous rank->GPU mappings). gloo ignores device_id.
-        dist.init_process_group(backend=ddp_backend,
+        # Collective timeout: rank 0 alone writes the end-of-training
+        # prediction files (minutes for a multi-million-frame set) while the
+        # other ranks already wait in the next collective; the default
+        # 10 min would abort them. Override with TORCHNEP_DIST_TIMEOUT_MIN.
+        from datetime import timedelta
+        _to = timedelta(minutes=float(os.environ.get(
+            "TORCHNEP_DIST_TIMEOUT_MIN", 180)))
+        dist.init_process_group(backend=ddp_backend, timeout=_to,
                                 device_id=dev if cuda_available else None)
         # Tear the group down once, at process exit — NOT at the end of this
         # function. That lets a single script call train_nep_sharded() more than
@@ -274,6 +344,44 @@ def train_nep_sharded(
 
     is_main = rank == 0
     dtype = torch.float32 if precision == "float32" else torch.float64
+
+    # ---- Resume target + master RNG seed -----------------------------------
+    # Resolved BEFORE data loading: the validation split (valid_ratio) draws
+    # from the seed, so on resume the checkpoint's saved seed must win here —
+    # otherwise the resumed run would carve out a DIFFERENT validation subset
+    # and leak old validation frames into training. Only the seed is peeked;
+    # the full checkpoint restore happens after model/optimizer construction.
+    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    if resume_from is not None and finetune_from is not None:
+        raise ValueError("resume_from and finetune_from are mutually "
+                         "exclusive: resume_from continues a run, "
+                         "finetune_from starts a new one from weights")
+    resume_ckpt = None
+    if resume_from is not None:
+        if not os.path.exists(resume_from):
+            raise FileNotFoundError(f"resume_from: {resume_from} not found")
+        resume_ckpt = resume_from
+    elif restart and os.path.exists(ckpt_path) and finetune_from is None:
+        resume_ckpt = ckpt_path
+    if resume_ckpt is not None:
+        _saved_seed = torch.load(resume_ckpt, map_location="cpu",
+                                 weights_only=False).get("run_seed")
+        if _saved_seed is not None:
+            run_seed = _saved_seed  # continue the original streams + split
+
+    # rank 0 owns the seed (picks a random one when run_seed is None) and
+    # broadcasts it so every replica seeds identically — the DDP wrapper later
+    # broadcasts rank-0 weights anyway, but a shared seed also makes the
+    # per-epoch shuffle streams reproducible for a given run_seed. Seeded here,
+    # before model construction, so the NN weight init draws from it.
+    if run_seed is None and is_main:
+        import random
+        run_seed = random.randrange(1, 2**31 - 1)
+    seed_t = torch.tensor([run_seed if run_seed is not None else 0],
+                          dtype=torch.long, device=dev)
+    dist.broadcast(seed_t, src=0)
+    run_seed = int(seed_t.item())
+    torch.manual_seed(run_seed)
 
     # Only rank 0 logs. All app output already routes through _log (is_main-
     # guarded), but Python warnings (e.g. NEPModel's q_1111 redundancy notice)
@@ -321,13 +429,12 @@ def train_nep_sharded(
             _log(line)
         _log("")
     config = orig_config
-    lambda_1 = config["lambda_1"]
-    lambda_2 = config["lambda_2"]
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
     lr                 = config["lr"]
     stop_lr            = config["stop_lr"]
     scheduler_patience = config["scheduler_patience"]
+    early_stop         = int(config.get("early_stop", 0))  # 0 = off
     scheduler_factor   = config["scheduler_factor"]
     lr_scheduler_mode  = config["lr_scheduler"]     # "plateau" | "step"
     max_grad_norm      = config["max_grad_norm"]
@@ -344,15 +451,212 @@ def train_nep_sharded(
     # ---- Data: each rank loads 1/world_size of structures ----------------
     _log("Data")
     _log("----")
-    frames = read_xyz(data_file, energy_key=energy_key)
-    n_total = len(frames)
-    _log(f"  read {n_total} structures from {data_file} "
-         f"(energy label: {energy_key})")
+
+    # Streamed shard loading for large files: rank 0 makes one index pass
+    # (byte offset + natoms per frame, no parsing), broadcasts the offsets,
+    # and every rank then seek-reads ONLY its own frames. This replaces the
+    # old "every rank parses the whole file" path, whose readlines() line
+    # list alone costs tens of GB per rank on a multi-10-GB file.
+    _STREAM_THRESHOLD = int(os.environ.get("TORCHNEP_STREAM_THRESHOLD",
+                                           2 * 1024 ** 3))
+    streamed = os.path.getsize(data_file) >= _STREAM_THRESHOLD
+    _stream_valid_local = None
+    _slim_keep = None
+    if streamed:
+        from .data import index_xyz, read_xyz_at
+        bcast_dev = dev if dist.get_backend() == "nccl" else torch.device("cpu")
+        if is_main:
+            t0 = time.time()
+            offs_np, _nat_np = index_xyz(data_file)
+            _log(f"  indexed {len(offs_np)} structures from {data_file} in "
+                 f"{time.time() - t0:.1f}s (streamed shard loading, "
+                 f"{os.path.getsize(data_file) / 2**30:.1f} GiB; "
+                 f"energy label: {energy_key})")
+            n_all_t = torch.tensor([len(offs_np)], dtype=torch.long,
+                                   device=bcast_dev)
+        else:
+            n_all_t = torch.zeros(1, dtype=torch.long, device=bcast_dev)
+        dist.broadcast(n_all_t, 0)
+        n_all = int(n_all_t.item())
+        offs_t = torch.empty(n_all, dtype=torch.long, device=bcast_dev)
+        if is_main:
+            offs_t.copy_(torch.from_numpy(offs_np).to(bcast_dev))
+        dist.broadcast(offs_t, 0)
+        offs_all = offs_t.cpu().numpy()
+        del offs_t
+
+        if valid_file is not None and valid_ratio is not None:
+            raise ValueError(
+                "valid_file and valid_ratio are mutually exclusive")
+        val_idx_s = None
+        if valid_ratio is not None:
+            if valid_strategy == "stratified":
+                _log("  streamed loader: the stratified valid split needs "
+                     "full-file metadata — using the random strategy "
+                     "(same run_seed) for this large file")
+            train_idx_s, val_idx_s = valid_split_indices(
+                n_all, valid_ratio, run_seed)
+            _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx_s)} "
+                 f"frames for validation, {len(train_idx_s)} remain for "
+                 f"training (split drawn from run_seed)")
+        else:
+            train_idx_s = np.arange(n_all)
+        train_offs = offs_all[np.asarray(train_idx_s, dtype=np.int64)]
+        n_total = len(train_offs)
+
+        shuffle_g = torch.Generator()
+        shuffle_g.manual_seed(0)
+        # numpy, not a Python list: a list of 13M ints costs ~0.5 GB/rank
+        global_perm = torch.randperm(n_total, generator=shuffle_g).numpy()
+        n_local = (n_total + world_size - 1) // world_size  # ceil
+        pad = n_local * world_size - n_total
+        if pad:
+            global_perm = np.concatenate([global_perm, global_perm[:pad]])
+        local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
+        del global_perm
+        t0 = time.time()
+        frames = None
+        local_frames = read_xyz_at(
+            data_file, train_offs[local_global_idx],
+            energy_key=energy_key)
+        del train_offs
+        _log(f"  parsed local shard ({len(local_frames)} frames) in "
+             f"{time.time() - t0:.1f}s")
+
+        valid_frames = None
+        n_valid_total = 0
+        valid_local_global_idx = None
+        if val_idx_s is not None and len(val_idx_s):
+            n_valid_total = len(val_idx_s)
+            voffs = offs_all[np.asarray(val_idx_s, dtype=np.int64)]
+            vsh_g = torch.Generator()
+            vsh_g.manual_seed(0)
+            vperm_sh = torch.randperm(n_valid_total,
+                                      generator=vsh_g).tolist()
+            n_vlocal = (n_valid_total + world_size - 1) // world_size
+            vpad = n_vlocal * world_size - n_valid_total
+            if vpad:
+                vperm_sh = vperm_sh + vperm_sh[:vpad]
+            valid_local_global_idx = \
+                vperm_sh[rank * n_vlocal : (rank + 1) * n_vlocal]
+            _stream_valid_local = read_xyz_at(
+                data_file, voffs[np.asarray(valid_local_global_idx)],
+                energy_key=energy_key)
+        del offs_all
+
+        if slim_types:
+            # Global species union from the local shards (bitmask MAX).
+            present = torch.zeros(len(orig_config["type_names"]),
+                                  dtype=torch.long, device=dev)
+            name_pos = {t: i for i, t in
+                        enumerate(orig_config["type_names"])}
+            for f_ in local_frames + (_stream_valid_local or []):
+                for s in set(f_["species"]):
+                    present[name_pos[s]] = 1
+            dist.all_reduce(present, op=dist.ReduceOp.MAX)
+            keep = [t for i, t in enumerate(orig_config["type_names"])
+                    if int(present[i])]
+            removed = [t for t in orig_config["type_names"]
+                       if t not in keep]
+            if removed:
+                _slim_keep = keep
+                config = dict(orig_config)
+                config["type_names"] = keep
+                config["num_types"] = len(keep)
+                _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
+                     f"(removing: {removed})")
+            else:
+                _log("  slim_types: all types present in data, "
+                     "nothing to remove")
+
+    if not streamed:
+        frames = read_xyz(data_file, energy_key=energy_key)
+        _log(f"  read {len(frames)} structures from {data_file} "
+             f"(energy label: {energy_key})")
+
+    # ---- Validation set (same semantics as train_nep) ---------------------
+    # The ratio split draws from run_seed via a dedicated generator —
+    # identical on every rank (seed was broadcast above), so all ranks agree
+    # on the partition. Sorted indices keep *_test.out rows in input order.
+    if valid_file is not None and valid_ratio is not None:
+        raise ValueError("valid_file and valid_ratio are mutually exclusive")
+    if not streamed:
+        valid_frames = None
+    if valid_file is not None:
+        # Rank 0 indexes the validation file once (byte offsets, no
+        # parsing), broadcasts the offsets, and every rank seek-reads only
+        # its padded-perm shard — the same scheme as the streamed training
+        # shard. Previously every rank parsed the whole file (a 1 GiB file
+        # costs several GiB of transient host memory per rank, times the
+        # number of ranks in file-system traffic).
+        from .data import index_xyz, read_xyz_at
+        bcast_dev = dev if dist.get_backend() == "nccl" else torch.device("cpu")
+        if is_main:
+            t0 = time.time()
+            voffs_np, _ = index_xyz(valid_file)
+            nv_t = torch.tensor([len(voffs_np)], dtype=torch.long,
+                                device=bcast_dev)
+        else:
+            nv_t = torch.zeros(1, dtype=torch.long, device=bcast_dev)
+        dist.broadcast(nv_t, 0)
+        n_valid_total = int(nv_t.item())
+        voffs_t = torch.empty(n_valid_total, dtype=torch.long, device=bcast_dev)
+        if is_main:
+            voffs_t.copy_(torch.from_numpy(voffs_np).to(bcast_dev))
+        dist.broadcast(voffs_t, 0)
+        voffs = voffs_t.cpu().numpy()
+        del voffs_t
+        vsh_g = torch.Generator()
+        vsh_g.manual_seed(0)
+        vperm_sh = torch.randperm(n_valid_total, generator=vsh_g).numpy()
+        n_vlocal = (n_valid_total + world_size - 1) // world_size  # ceil
+        vpad = n_vlocal * world_size - n_valid_total
+        if vpad:
+            vperm_sh = np.concatenate([vperm_sh, vperm_sh[:vpad]])
+        valid_local_global_idx = vperm_sh[rank * n_vlocal:(rank + 1) * n_vlocal]
+        del vperm_sh
+        _stream_valid_local = read_xyz_at(
+            valid_file, voffs[valid_local_global_idx], energy_key=energy_key)
+        del voffs
+        valid_frames = None
+        _log(f"  validation file {valid_file}: {n_valid_total} structures, "
+             f"sharded across {world_size} ranks "
+             f"({len(_stream_valid_local)} per rank)")
+    elif not streamed and valid_ratio is not None:
+        # Same draw as export_valid_split / train_nep (see data.py).
+        if valid_strategy == "stratified":
+            metas = [(f["natoms"], f["species"]) for f in frames]
+            train_idx, val_idx, st = stratified_split_indices(
+                metas, valid_ratio, run_seed)
+            _log(f"  valid_ratio={valid_ratio} (stratified by composition x "
+                 f"cell size): {st['n_strata']} strata; "
+                 f"{st['n_tiny_frames']} tiny-cell (<=4 atoms) frames and "
+                 f"{st['n_rare_frames']} rare-stratum frames kept fully in "
+                 f"training; held out {len(val_idx)} frames, "
+                 f"{len(train_idx)} remain (split drawn from run_seed)")
+            if st.get("fallback") == "random":
+                _log("  stratified split starved the validation set "
+                     "(dataset is dominated by tiny/rare strata) — fell "
+                     "back to a random split with the same seed")
+        elif valid_strategy == "random":
+            train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
+                                                     run_seed)
+            _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} "
+                 f"frames for validation, {len(train_idx)} remain for "
+                 f"training (split drawn from run_seed)")
+        else:
+            raise ValueError(f"unknown valid_strategy: {valid_strategy!r}")
+        valid_frames = [frames[i] for i in val_idx]
+        frames = [frames[i] for i in train_idx]
+    if not streamed:
+        n_total = len(frames)
 
     # slim_types: all ranks agree on which types to keep (deterministic scan)
-    _slim_keep = None
-    if slim_types:
+    if not streamed and slim_types:
         seen_species = set(s for f in frames for s in f["species"])
+        if valid_frames is not None:
+            seen_species |= set(s for f in valid_frames
+                                for s in f["species"])
         keep = [t for t in orig_config["type_names"] if t in seen_species]
         removed = [t for t in orig_config["type_names"] if t not in keep]
         if removed:
@@ -376,50 +680,114 @@ def train_nep_sharded(
     # both numerator and denominator), and the predict scatter writes
     # identical values into the duplicated slots, so output is loss-fair
     # and complete.
-    shuffle_g = torch.Generator()
-    shuffle_g.manual_seed(0)
-    global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
-    n_local = (n_total + world_size - 1) // world_size  # ceil
-    pad = n_local * world_size - n_total
-    if pad:
-        global_perm = global_perm + global_perm[:pad]
-    local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
-    local_frames = [frames[i] for i in local_global_idx]
+    if not streamed:
+        shuffle_g = torch.Generator()
+        shuffle_g.manual_seed(0)
+        global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
+        n_local = (n_total + world_size - 1) // world_size  # ceil
+        pad = n_local * world_size - n_total
+        if pad:
+            global_perm = global_perm + global_perm[:pad]
+        local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
+        local_frames = [frames[i] for i in local_global_idx]
     pad_note = (f", {pad} frame(s) duplicated for even split"
                 if pad else "")
     _log(f"  sharded across {world_size} ranks: "
-         f"{n_local} frames per rank{pad_note}")
+         f"{len(local_frames)} frames per rank{pad_note}")
 
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
-    structures = preprocess_structures(local_frames, config, np_dtype)
-    _log(f"  built neighbor lists (local shard) in {time.time() - t0:.1f}s")
+    # Neighbor layout: every rank estimates its own shard; the most
+    # memory-saving choice wins globally (all-reduce MAX) so all ranks share
+    # one layout (identical numerics / pair ordering across the job).
+    est_frames = list(local_frames) + list(valid_frames or [])
+    if _stream_valid_local is not None:
+        est_frames += list(_stream_valid_local)
+    nmode, est, budget = choose_neighbor_mode(
+        est_frames, config, neighbor_mode, itemsize=np.dtype(np_dtype).itemsize)
+    mode_t = torch.tensor([NEIGHBOR_MODES.index(nmode)], dtype=torch.long,
+                          device=dev)
+    dist.all_reduce(mode_t, op=dist.ReduceOp.MAX)
+    nmode = NEIGHBOR_MODES[int(mode_t.item())]
+    _log(f"  neighbor_mode: {nmode} (requested {neighbor_mode}; rank-0 shard "
+         f"estimate cached {_fmt_gb(est['cached'])} / compact "
+         f"{_fmt_gb(est['compact'])} / on_the_fly {_fmt_gb(est['on_the_fly'])}"
+         + (f", budget {_fmt_gb(budget)} per rank)" if budget else ")"))
+    del est_frames
+    structures = preprocess_structures(local_frames, config, np_dtype,
+                                       mode=nmode)
+    del local_frames                # parsed frames are not needed any more
+    frames = None
+    _log(f"  built neighbor lists (local shard) in {time.time() - t0:.1f}s"
+         if nmode != "on_the_fly" else
+         f"  prepared geometry (local shard) in {time.time() - t0:.1f}s")
 
     # max_NN: local max then all-reduce so rank-0 has the global value
-    def _compute_max_neighbors_local(structures):
-        max_rad = max_ang = 0
-        for s in structures:
-            n = s["natoms"]
-            if len(s["pair_i_rad"]) > 0:
-                counts = np.bincount(s["pair_i_rad"], minlength=n)
-                max_rad = max(max_rad, int(counts.max()))
-            if len(s["pair_i_ang"]) > 0:
-                counts = np.bincount(s["pair_i_ang"], minlength=n)
-                max_ang = max(max_ang, int(counts.max()))
-        return max_rad, max_ang
+    _compute_max_neighbors_local = compute_max_neighbors
+
+    # Validation frames: sharded across ranks with the same padded-perm
+    # scheme as the training frames (equal shard sizes keep the per-epoch
+    # eval time balanced; a padding duplicate contributes its error twice in
+    # both numerator and denominator of the all-reduced sums — loss-fair,
+    # same argument as the training shards).
+    structures_v = None
+    if valid_frames is None and _stream_valid_local is None:
+        valid_local_global_idx = None
+        n_valid_total = 0
+    if _stream_valid_local is not None:
+        structures_v = preprocess_structures(_stream_valid_local, config,
+                                             np_dtype, mode=nmode)
+        del _stream_valid_local
+    if valid_frames is not None:
+        n_valid_total = len(valid_frames)
+        vsh_g = torch.Generator()
+        vsh_g.manual_seed(0)
+        vperm_sh = torch.randperm(n_valid_total, generator=vsh_g).tolist()
+        n_vlocal = (n_valid_total + world_size - 1) // world_size  # ceil
+        vpad = n_vlocal * world_size - n_valid_total
+        if vpad:
+            vperm_sh = vperm_sh + vperm_sh[:vpad]
+        valid_local_global_idx = \
+            vperm_sh[rank * n_vlocal : (rank + 1) * n_vlocal]
+        structures_v = preprocess_structures(
+            [valid_frames[i] for i in valid_local_global_idx],
+            config, np_dtype, mode=nmode)
+        del valid_frames
 
     local_max_rad, local_max_ang = _compute_max_neighbors_local(structures)
+    if structures_v is not None:
+        # nep.txt records max neighbor counts for MD buffer sizing — cover
+        # the validation frames too (folded into the same all-reduce).
+        v_max_rad, v_max_ang = _compute_max_neighbors_local(structures_v)
+        local_max_rad = max(local_max_rad, v_max_rad)
+        local_max_ang = max(local_max_ang, v_max_ang)
+
+    t0 = time.time()
+    data_store = StreamDataStore(structures, dev, dtype, config=config,
+                                 neighbor_mode=nmode)
+    del structures
+    valid_store = None
+    if structures_v is not None:
+        valid_store = StreamDataStore(structures_v, dev, dtype, config=config,
+                                      neighbor_mode=nmode)
+        del structures_v
+    if nmode == "on_the_fly":
+        # no host pair lists: one device pass over the shard gives the
+        # neighbor counts nep.txt needs
+        local_max_rad, local_max_ang = data_store.scan_max_neighbors()
+        if valid_store is not None:
+            v_max_rad, v_max_ang = valid_store.scan_max_neighbors()
+            local_max_rad = max(local_max_rad, v_max_rad)
+            local_max_ang = max(local_max_ang, v_max_ang)
     nn_t = torch.tensor([local_max_rad, local_max_ang], dtype=torch.long,
                         device=dev)
     dist.all_reduce(nn_t, op=dist.ReduceOp.MAX)
     max_NN_rad, max_NN_ang = int(nn_t[0].item()), int(nn_t[1].item())
-
-    t0 = time.time()
-    data_store = GPUDataStore(structures, dev, dtype, config=config)
-    del structures
     if cuda_available:
         torch.cuda.synchronize()
-    _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
+    _log(f"  data store ready ({nmode}, {_fmt_gb(data_store.memory_bytes())} "
+         f"of pair/geometry data per rank): shard in host memory, batches "
+         f"streamed to {dev} ({time.time() - t0:.1f}s)")
 
     # Aggregate data counts across all ranks for the banner
     counts_t = torch.tensor(
@@ -429,27 +797,45 @@ def train_nep_sharded(
     dist.all_reduce(counts_t)
     g_n, g_ne, g_nf, g_nv = counts_t.tolist()
     _log(f"  coverage (global): {g_ne} E / {g_nf} F / {g_nv} V")
+    if valid_store is not None:
+        vcounts_t = torch.tensor(
+            [valid_store.n_energy, valid_store.n_forces,
+             valid_store.n_virial, int(valid_store.has_forces),
+             int(valid_store.has_virial)],
+            dtype=torch.long, device=dev)
+        dist.all_reduce(vcounts_t)
+        gv_ne, gv_nf, gv_nv = vcounts_t[:3].tolist()
+        # Global channel flags for the per-epoch validation eval — per-rank
+        # shards may lack a channel that other shards have.
+        valid_has_forces = bool(vcounts_t[3].item() > 0)
+        valid_has_virial = bool(vcounts_t[4].item() > 0)
+        _log(f"  validation coverage (global, incl. padding): "
+             f"{gv_ne} E / {gv_nf} F / {gv_nv} V")
     _log("")
 
     # ---- Model -----------------------------------------------------------
     _log("Model")
     _log("-----")
+    _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
 
-    # use_gpumd_qscaler: reproduce GPUMD's init (descriptor coeffs uniform(-1,1)
-    # + c=1 q_scaler). Re-init on rank 0 then broadcast so every replica starts
-    # identical; skipped under finetune_from (keep the loaded coefficients).
+    # use_gpumd_qscaler: reproduce GPUMD's init (SNES mu init — every parameter
+    # uniform(-1,1): descriptor coeffs AND NN weights — plus the c=1 q_scaler).
+    # Re-init on rank 0 then broadcast so every replica starts identical;
+    # skipped under finetune_from (keep the loaded parameters).
     if use_gpumd_qscaler and finetune_from is None:
         with torch.no_grad():
             if rank == 0:
-                torch.nn.init.uniform_(model.c_param_2, -1.0, 1.0)
-                if model.c_param_3 is not None:
-                    torch.nn.init.uniform_(model.c_param_3, -1.0, 1.0)
+                gpumd_init_parameters(model)
             dist.broadcast(model.c_param_2.data, src=0)
             if model.c_param_3 is not None:
                 dist.broadcast(model.c_param_3.data, src=0)
-        _log("  use_gpumd_qscaler: descriptor coeffs re-init uniform(-1,1), "
-             "q_scaler will use c=1 (GPUMD-consistent)")
+            for net in model.fitting_nets:
+                dist.broadcast(net.w0.data, src=0)
+                dist.broadcast(net.b0.data, src=0)
+                dist.broadcast(net.w1.data, src=0)
+        _log("  use_gpumd_qscaler: descriptor coeffs + NN weights re-init "
+             "uniform(-1,1), q_scaler will use c=1 (GPUMD-consistent)")
 
     # b1 (global energy offset) is determined analytically (folded into the
     # training pass + the best-model eval), not by gradient descent — keep it
@@ -507,6 +893,13 @@ def train_nep_sharded(
     # backend — the backend choice depends on it. Only the analytical path is
     # compiled; the autograd path's create_graph=True double backward is
     # incompatible with compile, so it stays eager.
+    # use_compile=None means AUTO: compile on GPU (where it is 3-5x),
+    # stay eager on CPU (C++ Inductor warmup outweighs the gain for
+    # typical CPU-sized runs). Explicit True/False always wins; every
+    # failed capability check degrades to eager with a log line instead
+    # of raising.
+    if use_compile is None:
+        use_compile = dev.type in ("cuda", "xpu")
     compile_on = False
     compile_msg = None
     if use_compile:
@@ -514,20 +907,22 @@ def train_nep_sharded(
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
         elif use_autograd_forces:
-            compile_msg = ("  torch.compile: skipped — incompatible with "
-                           "autograd double-backward forces")
+            compile_on = True
+            compile_msg = ("  torch.compile: enabled (make_fx autograd "
+                           "force graph)")
         else:
             compile_on = True
             compile_msg = "  torch.compile: enabled (analytical compute method)"
 
-    # ``backend`` is the eager backend for the one-shot q_scaler pass
-    # (num_types-based); ``train_backend`` is what the per-batch compute uses —
-    # bmm whenever compiling. Explicit backend= wins for both.
+    # Backends are chosen automatically (see ops.resolve_backend):
+    # ``backend`` is the eager choice (q_scaler / eval), ``train_backend``
+    # adds the use_compile rule.
     from .ops import resolve_backend as _resolve_backend
-    orig_backend = backend
-    backend = _resolve_backend(orig_backend, num_types=model.num_types)
-    train_backend = _resolve_backend(
-        orig_backend, num_types=model.num_types, use_compile=compile_on)
+    backend = _resolve_backend("auto", num_types=model.num_types,
+                               device_type=dev.type)
+    train_backend = _resolve_backend("auto", num_types=model.num_types,
+                                     use_compile=compile_on,
+                                     device_type=dev.type)
     force_str = "autograd" if use_autograd_forces else "analytical"
     if train_backend != backend:
         _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
@@ -544,10 +939,14 @@ def train_nep_sharded(
             _log("  q_scaler: RECOMPUTED from the new dataset "
                  "(recompute_q_scaler=True) — the loaded weights will "
                  "see rescaled descriptors and must re-adapt")
-        # q_scaler: local shard -> all_reduce
+        # q_scaler: local shard -> all_reduce. The pass uses the training
+        # batch size so its transient GPU footprint stays batch-bound
+        # (min/max is chunking-invariant — result unchanged).
         t_qs = time.time()
         q_min, q_max = _compute_q_scaler_sharded(
-            model, data_store, backend=backend, gpumd_init=use_gpumd_qscaler)
+            model, data_store, backend=backend,
+            batch_size=batch_size,
+            gpumd_init=use_gpumd_qscaler)
         model.set_q_scaler(q_min, q_max)
         if cuda_available:
             torch.cuda.synchronize()
@@ -564,7 +963,13 @@ def train_nep_sharded(
         _log(compile_msg)
     if compile_on:
         _quiet_compile_logs()
-    shim = _NEPDDPShim(model, use_compile=compile_on)
+        # Fuse the per-batch basis kernels too — same numerical status
+        # as the compiled compute (Inductor-level ~1e-7 deviations).
+        data_store.compile_basis()
+        if valid_store is not None:
+            valid_store.compile_basis()
+    shim = _NEPDDPShim(model, use_compile=compile_on,
+                       use_autograd_forces=use_autograd_forces)
     # All per-type nets are always touched in compute_properties_cached (dummy
     # pass for types absent in a given batch) so DDP sees every parameter in
     # every step — no need for find_unused_parameters, and no implicit grad
@@ -578,14 +983,22 @@ def train_nep_sharded(
     raw_model = _shim.model
 
     # b1 is analytically determined (not gradient-trained) — exclude it from
-    # the optimizer (and L1), matching the single-GPU path.
-    trainable_params = [p for n, p in raw_model.named_parameters()
-                        if n != "b1"]
-    optimizer = torch.optim.Adam(trainable_params, lr=lr,
-                                 weight_decay=lambda_2, amsgrad=True)
+    # the optimizer, matching the single-GPU path.
+    trainable_named = [(n, p) for n, p in raw_model.named_parameters()
+                       if n != "b1"]
+    # weight_decay > 0 switches to AdamW (decoupled decay) — see train_nep.
+    weight_decay = config["weight_decay"]
+    optimizer = _make_optimizer(trainable_named, lr, weight_decay)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
+
+    # SWA window: average only the tail of the run (default: the last 100
+    # epochs). Averaging the whole of stage 2 drags the energy back toward
+    # mid-descent weights (E converges late); the tail is a converged
+    # cloud, so averaging there is pure noise reduction.
+    if swa_start is None:
+        swa_start = max(1, num_epochs - 99)
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
@@ -603,7 +1016,13 @@ def train_nep_sharded(
             config.get("stage2_scheduler_factor", scheduler_factor),
             config.get("stage2_scheduler_patience", scheduler_patience),
             stop_lr)
-        if use_swa and is_main:
+        if use_swa:
+            # EVERY rank maintains the average (DDP keeps raw_model
+            # identical across ranks, so the averages are identical too).
+            # Keeping it main-only deadlocked the tail: rank 0 entered the
+            # SWA-b1 all_reduce while the other ranks skipped the block and
+            # sat in the final predict's all_gather — collective sequences
+            # diverged and both sides hit the NCCL watchdog timeout.
             swa_model = AveragedModel(raw_model)
 
     # Snapshot of current loss weights — saved in checkpoint so a restart can
@@ -615,36 +1034,46 @@ def train_nep_sharded(
         "stage2_pref_v": stage2_pref_v,
     }
 
-    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    # resume_ckpt / ckpt_path were resolved before data loading (the seed
+    # peek); here the full training state is actually restored.
     start_epoch = 1
     best_loss = float("inf")
     best_true_loss = float("inf")
+    best_valid_loss = float("inf")
+    cur_valid_info = {"valid_file": valid_file, "valid_ratio": valid_ratio}
+    if valid_strategy != "random":
+        cur_valid_info["valid_strategy"] = valid_strategy
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
-    if resume_from is not None and finetune_from is not None:
-        raise ValueError("resume_from and finetune_from are mutually "
-                         "exclusive: resume_from continues a run, "
-                         "finetune_from starts a new one from weights")
-    resume_ckpt = None
-    if resume_from is not None:
-        if not os.path.exists(resume_from):
-            raise FileNotFoundError(f"resume_from: {resume_from} not found")
-        resume_ckpt = resume_from
-    elif restart and os.path.exists(ckpt_path) and finetune_from is None:
-        resume_ckpt = ckpt_path
     if resume_ckpt is not None:
         # Every rank loads the same file; model weights go into raw_model
         # (the plain NEPModel — keeps checkpoints interchangeable with
-        # single-GPU runs). swa_model is None on non-main ranks, so SWA
-        # state is restored on rank 0 only — consistent with rank-0-only
-        # SWA updates.
+        # single-GPU runs). SWA state restores on every rank (all ranks
+        # maintain the average — see the AveragedModel construction).
         info = _load_checkpoint(resume_ckpt, raw_model, optimizer,
                                 lr_scheduler, stage2_scheduler,
                                 swa_model, dev)
+        if weight_decay > 0:  # see train_nep: reapply after state load
+            for _g in optimizer.param_groups:
+                _g["weight_decay"] = weight_decay
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
+        best_valid_loss = info["best_valid_loss"]
+        # A checkpoint already in stage 2 pins the EFFECTIVE stage-2 start
+        # (may be earlier than nep.in's after a stage-1 early-stop jump);
+        # stage-1 checkpoints defer to nep.in — see train_nep.
+        if stage2 and info["in_stage2"] and info.get("start_stage2") is not None:
+            start_stage2 = info["start_stage2"]
+        saved_valid_info = info.get("valid_info")
+        if saved_valid_info is not None and saved_valid_info != cur_valid_info:
+            _log("WARNING: validation settings changed since the checkpoint "
+                 "was saved — the train/valid split is NOT the one this run "
+                 "started with (old validation frames may enter training).")
+            _log(f"  saved:   {saved_valid_info}")
+            _log(f"  current: {cur_valid_info}")
+            best_valid_loss = float("inf")
         _log(f"Resumed from {resume_ckpt}: epoch {start_epoch - 1}, "
-             f"best_loss={best_loss:.4e}")
+             f"best_loss={best_loss:.4e}, run_seed={run_seed}")
         # Resume = exact continuation: lr (and the whole optimizer state)
         # comes from the checkpoint moment. nep.in's lr only applies to
         # fresh runs / finetunes — and stage2_lr at a fresh stage-2 entry.
@@ -660,6 +1089,7 @@ def train_nep_sharded(
             _log(f"  current: {cur_loss_weights}")
             best_loss = float("inf")
             best_true_loss = float("inf")
+            best_valid_loss = float("inf")
 
     n_local = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
@@ -677,8 +1107,15 @@ def train_nep_sharded(
                         or os.path.getsize(loss_log_path) == 0)
         loss_log = open(loss_log_path, "w" if start_epoch == 1 else "a")
         if write_header:
-            loss_log.write("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
-                           "rmse_v(eV/atom)  rmse_stress(GPa)\n")
+            hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
+                   "rmse_v(eV/atom)  rmse_stress(GPa)")
+            if valid_store is not None:
+                # GPUMD loss.out convention: train RMSEs, then test RMSEs.
+                # (The loss column is then the VALIDATION loss — it is what
+                # drives the scheduler and the best-model choice.)
+                hdr += ("  rmse_e_test(eV/atom)  rmse_f_test(eV/A)  "
+                        "rmse_v_test(eV/atom)  rmse_stress_test(GPa)")
+            loss_log.write(hdr + "\n")
 
     # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
     # already printed by format_config_summary above; here we just announce
@@ -687,6 +1124,13 @@ def train_nep_sharded(
     stage2_tag = (f", Stage 2 from epoch {start_stage2} "
                   f"(SWA={'on' if use_swa else 'off'})") if stage2 else ""
     _log("")
+    if early_stop:
+        monitored = "validation loss" if valid_store is not None else "train loss"
+        if early_stop <= scheduler_patience:
+            _log(f"WARNING: early_stop ({early_stop}) <= scheduler_patience "
+                 f"({scheduler_patience}); use early_stop > scheduler_patience.")
+        _log(f"Early stopping: stop if {monitored} does not improve for "
+             f"{early_stop} epochs")
     _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
     _log("=" * 72)
 
@@ -700,7 +1144,20 @@ def train_nep_sharded(
             os.path.join(output_dir, "nep_best.txt"),
             max_NN_rad, max_NN_ang)
 
+    # Early-stopping tracker (see train_nep). sched_loss is all-reduced, so
+    # every rank sees the same value and stops on the same epoch.
+    es_best = float("inf")
+    es_wait = 0
+    prev_in_stage2 = False
+
     train_t0 = time.time()
+
+    # GPU-side non-finite-gradient guard when the fused optimizer supports
+    # the AMP found_inf hook — see train_nep.
+    async_guard = (dev.type == "cuda"
+                   and optimizer.param_groups[0].get("fused", False)
+                   and getattr(optimizer, "_step_supports_amp_scaling",
+                               False))
 
     try:
         for epoch in range(start_epoch, num_epochs + 1):
@@ -713,13 +1170,15 @@ def train_nep_sharded(
             # batch_size) is identical across ranks because n_local is —
             # so DDP collectives stay in lock-step.
             g = torch.Generator()
-            g.manual_seed(epoch * world_size + rank)
+            g.manual_seed(run_seed + epoch * world_size + rank)
             perm = torch.randperm(n_local, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/A**3)**2
-            sum_e_structs = sum_f_atoms = sum_v_structs = 0
-            sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
-            max_gn = 0.0
+            # Device-side accumulators, fetched (and all-reduced) once per
+            # epoch — see train_nep. Layout:
+            # [sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, resid]
+            acc = torch.zeros(8, dtype=torch.float64, device=dev)
+            max_gn_t = torch.zeros((), dtype=dtype, device=dev)
+            n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
@@ -751,7 +1210,10 @@ def train_nep_sharded(
                                 epoch - 1, best_loss,
                                 loss_weights=cur_loss_weights,
                                 in_stage2=False, swa_model=None,
-                                best_true_loss=best_true_loss)
+                                best_true_loss=best_true_loss,
+                                run_seed=run_seed,
+                                best_valid_loss=best_valid_loss,
+                                valid_info=cur_valid_info)
                             _log("Saved end-of-stage-1 checkpoint: "
                                  "checkpoint_stage1.pt (redo stage 2 from "
                                  "it via resume_from)")
@@ -759,6 +1221,7 @@ def train_nep_sharded(
                             pg['lr'] = stage2_lr
                         best_loss = float("inf")
                         best_true_loss = float("inf")
+                        best_valid_loss = float("inf")
                         _log(f"Stage 2 started at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
                              f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
@@ -783,9 +1246,36 @@ def train_nep_sharded(
             has_forces = global_has_forces and cur_pref_f > 0
             has_virial = global_has_virial and cur_pref_v > 0
 
-            for start in range(0, n_local, batch_size):
-                idx = perm[start:start + batch_size]
-                batch = data_store.collate(idx)
+            batch_indices = [perm[start:start + batch_size]
+                             for start in range(0, n_local, batch_size)]
+
+            # Global label counts of every step (energies / force atoms /
+            # virial frames, summed over ranks) are fixed by the epoch's
+            # batch composition, so they are computed for all steps here and
+            # all-reduced in ONE collective. This replaces a 24-byte
+            # all_reduce inside every step, which was latency-bound and
+            # dominated the epoch at large rank counts. Values are identical
+            # to the per-step path.
+            _pp = torch.as_tensor(perm)
+            _z = torch.zeros(n_local, dtype=torch.float64)
+            _per_frame = torch.stack([
+                data_store._e_flag_t[_pp].to(torch.float64),
+                (data_store._f_flag_t[_pp].to(torch.float64)
+                 * data_store._nat_t[_pp].to(torch.float64))
+                if has_forces else _z,
+                data_store._v_flag_t[_pp].to(torch.float64)
+                if has_virial else _z,
+            ], dim=1)
+            _cs = torch.cat([torch.zeros(1, 3, dtype=torch.float64),
+                             torch.cumsum(_per_frame, dim=0)])
+            _starts = torch.arange(0, n_local, batch_size)
+            _ends = (_starts + batch_size).clamp(max=n_local)
+            cg_all = (_cs[_ends] - _cs[_starts]).to(dev)
+            dist.all_reduce(cg_all)
+            cg_all = cg_all.clamp(min=1.0).to(dtype)
+
+            for _bi, batch in enumerate(
+                    iter_collated(data_store, batch_indices)):
 
                 # Go through DDP wrapper (not raw_model.compute_*) so the
                 # reducer arms backward all-reduce for this step.
@@ -794,9 +1284,11 @@ def train_nep_sharded(
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
-                e_mask = batch["energy_mask"]
-                f_mask = batch["force_mask"] if has_forces else None
-                v_mask = batch["virial_mask"] if has_virial else None
+                emf = batch["energy_mask"].to(dtype)
+                fmf = (batch["force_mask"].to(dtype).unsqueeze(-1)
+                       if has_forces else None)
+                vmf = (batch["virial_mask"].to(dtype).unsqueeze(-1)
+                       if has_virial else None)
 
                 # --- DDP-correct normalisation --------------------------
                 # DDP averages gradients by world_size. If each rank used a
@@ -809,101 +1301,122 @@ def train_nep_sharded(
                 # by the GLOBAL count (all-reduced per batch). The * world_size
                 # factor cancels DDP's /world_size averaging — giving a true
                 # global-mean loss regardless of how atoms are sharded.
-                counts = torch.tensor([
-                    float(e_mask.sum().item()),
-                    float(f_mask.sum().item()) if f_mask is not None else 0.0,
-                    float(v_mask.sum().item()) if v_mask is not None else 0.0,
-                ], device=dev, dtype=torch.float64)
-                dist.all_reduce(counts)
-                n_e_g = max(counts[0].item(), 1.0)
-                n_f_g = max(counts[1].item(), 1.0)
-                n_v_g = max(counts[2].item(), 1.0)
+                # The global counts of this step were precomputed and
+                # all-reduced once per epoch above (cg_all); they stay DEVICE
+                # tensors end to end (the divisions are stream-ordered) —
+                # fetching them per batch would drain the compute stream every
+                # step. Loss and metric terms are likewise branchless masked
+                # sums; the scalars are read back together after the grad-norm
+                # guard's sync, where they cost nothing.
+                cg = cg_all[_bi]
                 ws = float(world_size)
 
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
+                m_le = m_resid = m_lf = m_lv = m_ls = None
 
-                if e_mask.any():
-                    diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
-                    sum_sq_e = (diff_e ** 2).sum()
-                    loss = loss + cur_pref_e * sum_sq_e * ws / n_e_g
-                    sum_le += sum_sq_e.item()  # global sum-of-squared-errors
+                if batch["has_e"]:
+                    de = (e_pa_pred - e_pa_ref) * emf
+                    loss = loss + cur_pref_e * (de ** 2).sum() * ws / cg[0]
+                    m_le = (de ** 2).sum()           # global SSE
                     # Signed residual for the analytical b1 update (folded into
                     # this pass; all-reduced below with the other metrics).
-                    sum_e_resid += diff_e.sum().item()
+                    m_resid = de.sum()
 
-                if f_mask is not None and f_mask.any():
-                    f_pred = result["forces"][f_mask]
-                    f_ref = batch["forces"][f_mask]
-                    sum_sq_f = ((f_pred - f_ref) ** 2).sum()
+                if fmf is not None and batch["has_f"]:
+                    df = (result["forces"] - batch["forces"]) * fmf
                     # 3 components per atom -> divide by (3 * n_f_g)
-                    loss = loss + cur_pref_f * sum_sq_f * ws / (3.0 * n_f_g)
-                    sum_lf += (sum_sq_f.item() / 3.0)
+                    loss = loss + cur_pref_f * (df ** 2).sum() * ws / (3.0 * cg[1])
+                    m_lf = (df ** 2).sum() / 3.0
 
-                if v_mask is not None and v_mask.any() and "virial" in result:
-                    v_atom = result["virial"]
-                    v_sys = torch.zeros(batch["num_structures"], 9,
-                                        dtype=dtype, device=dev)
-                    si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
-                    v_sys.scatter_add_(0, si, v_atom)
-                    v_ref = batch["virial"]
-                    if v_ref.shape[1] == 9:
-                        na = batch["natoms"][v_mask].unsqueeze(-1)
-                        # 6 unique components only (see _VIRIAL_6); all 9 would
-                        # weight the symmetric off-diagonals twice.
-                        v_pred_pa = v_sys[:, _VIRIAL_6][v_mask] / na
-                        v_ref_pa = v_ref[:, _VIRIAL_6][v_mask] / na
-                        v_diff = v_pred_pa - v_ref_pa
-                        sum_sq_v = (v_diff ** 2).sum()
-                        # 6 components per frame -> divide by (6 * n_v_g)
-                        loss = loss + cur_pref_v * sum_sq_v * ws / (6.0 * n_v_g)
-                        sum_lv += (sum_sq_v.item() / 6.0)
-                        # Stress (eV/A**3) = virial_total / V. Sign cancels in MSE.
-                        scale = (batch["natoms"][v_mask]
-                                 / batch["volumes"][v_mask]).unsqueeze(-1)
-                        sum_sq_s = ((v_diff * scale) ** 2).sum()
-                        sum_ls += (sum_sq_s.item() / 6.0)
+                if (vmf is not None and batch["has_v"] and "virial" in result
+                        and batch["virial"].shape[1] == 9):
+                    na = batch["natoms"].unsqueeze(-1)
 
-                if lambda_1 > 0:
-                    l1 = sum(p.abs().sum() for p in trainable_params)
-                    loss = loss + lambda_1 * l1
+                    def _v_pred_pa(res):
+                        v_sys = torch.zeros(batch["num_structures"], 9,
+                                            dtype=dtype, device=dev)
+                        si = batch["struct_idx"].unsqueeze(-1).expand_as(
+                            res["virial"])
+                        v_sys.scatter_add_(0, si, res["virial"])
+                        return v_sys[:, _VIRIAL_6] / na
+                    # 6 unique components only (see _VIRIAL_6); all 9 would
+                    # weight the symmetric off-diagonals twice.
+                    v_pred_pa = _v_pred_pa(result)
+                    v_ref_pa = batch["virial"][:, _VIRIAL_6] / na
+                    dv = (v_pred_pa - v_ref_pa) * vmf
+                    # 6 components per frame -> divide by (6 * n_v_g)
+                    loss = loss + cur_pref_v * (dv ** 2).sum() * ws / (6.0 * cg[2])
+                    m_lv = (dv ** 2).sum() / 6.0
+                    # Stress (eV/A**3) = virial_total / V. Sign cancels in MSE.
+                    # clamp: masked-out frames may carry volume 0 — their
+                    # contribution is already zeroed by the mask factor.
+                    scale = (batch["natoms"]
+                             / batch["volumes"].clamp(min=1e-9)).unsqueeze(-1)
+                    m_ls = ((dv * scale) ** 2).sum() / 6.0
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
                 if max_grad_norm > 0:
-                    gn = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_grad_norm).item()
+                    gn_t = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm)
                 else:
-                    gn = torch.sqrt(sum(
+                    gn_t = torch.sqrt(sum(
                         p.grad.norm() ** 2 for p in raw_model.parameters()
-                        if p.grad is not None)).item()
+                        if p.grad is not None))
 
-                if not np.isfinite(gn):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
+                if async_guard:
+                    # GPU-side non-finite skip via the fused-Adam AMP hook —
+                    # see train_nep. NOTE: with the sync guard each rank
+                    # could in principle skip independently (a latent
+                    # lock-step hazard); the async flag keeps every rank
+                    # stepping, so collectives always stay aligned.
+                    bad = (~torch.isfinite(gn_t)).to(dtype)
+                    optimizer.found_inf = bad
+                    optimizer.step()
+                    n_bad_t += bad
+                    ok_f = (1.0 - bad).to(torch.float64)
+                else:
+                    gn = float(gn_t)
+                    if not np.isfinite(gn):
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    optimizer.step()
+                    ok_f = 1.0
 
-                optimizer.step()
-
-                if in_stage2 and swa_model is not None and is_main:
+                if (in_stage2 and swa_model is not None
+                        and epoch >= swa_start):
                     swa_model.update_parameters(raw_model)
 
-                sum_e_structs += batch["energy_mask"].sum().item()
-                sum_f_atoms += batch["force_mask"].sum().item()
-                sum_v_structs += batch["virial_mask"].sum().item()
-                max_gn = max(max_gn, gn)
+                zero64 = acc.new_zeros(())
+                acc += ok_f * torch.stack([
+                    m_le.double() if m_le is not None else zero64,
+                    m_lf.double() if m_lf is not None else zero64,
+                    m_lv.double() if m_lv is not None else zero64,
+                    m_ls.double() if m_ls is not None else zero64,
+                    (batch["energy_mask"].sum().double()
+                     if m_le is not None else zero64),
+                    (batch["force_mask"].sum().double()
+                     if m_lf is not None else zero64),
+                    (batch["virial_mask"].sum().double()
+                     if m_lv is not None else zero64),
+                    m_resid.double() if m_resid is not None else zero64,
+                ])
+                max_gn_t = torch.maximum(
+                    max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
 
-            metrics = torch.tensor(
-                [sum_le, sum_lf, sum_lv, sum_ls,
-                 float(sum_e_structs), float(sum_f_atoms),
-                 float(sum_v_structs), sum_e_resid],
-                device=dev)
-            dist.all_reduce(metrics)
-            gn_t = torch.tensor(max_gn, device=dev)
-            dist.all_reduce(gn_t, op=dist.ReduceOp.MAX)
+            # One epoch-level all-reduce + fetch of the device accumulators
+            # (the only metric sync of the epoch).
+            dist.all_reduce(acc)
+            dist.all_reduce(max_gn_t, op=dist.ReduceOp.MAX)
+            dist.all_reduce(n_bad_t, op=dist.ReduceOp.MAX)
             (sum_le, sum_lf, sum_lv, sum_ls,
              sum_e_structs, sum_f_atoms, sum_v_structs,
-             sum_e_resid) = metrics.tolist()
-            max_gn = gn_t.item()
+             sum_e_resid) = acc.tolist()
+            max_gn = float(max_gn_t)
+            if is_main and int(n_bad_t):
+                _log(f"  warning: {int(n_bad_t)} step(s) skipped this epoch "
+                     f"(non-finite gradient norm)")
 
             # Analytical b1 (GPUMD-style), folded into the training pass and
             # all-reduced above — identical on every rank. Updated before the
@@ -927,27 +1440,98 @@ def train_nep_sharded(
             rmse_f = np.sqrt(mse_f)                           # eV/A
             rmse_v = np.sqrt(mse_v)                           # eV/atom
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa    # GPa
+
+            # Validation (COLLECTIVE): each rank evaluates its valid shard
+            # with frozen weights, the error sums are all-reduced, so every
+            # rank sees the bit-identical validation loss — required because
+            # this loss drives the scheduler and best-save branch on all
+            # ranks. b1 stays train-fitted (never re-fitted on validation —
+            # that would leak validation info into the saved model).
+            valid_loss = None
+            if valid_store is not None:
+                v_sums = _accumulate_true_loss_sums(
+                    valid_store, batch_size, raw_model,
+                    raw_model.compute_properties, _shim._compute_cached,
+                    use_autograd_forces, train_backend,
+                    valid_has_forces and cur_pref_f > 0,
+                    valid_has_virial and cur_pref_v > 0, dtype, dev)
+                v_sums_t = torch.tensor(v_sums, device=dev,
+                                        dtype=torch.float64)
+                dist.all_reduce(v_sums_t)
+                (v_le, v_lf, v_lv, v_ls,
+                 v_ne, v_nf, v_nv, _) = v_sums_t.tolist()
+                v_mse_e = v_le / max(v_ne, 1.0)
+                v_mse_f = v_lf / max(v_nf, 1.0)
+                v_mse_v = v_lv / max(v_nv, 1.0)
+                v_mse_s = v_ls / max(v_nv, 1.0)
+                valid_loss = (cur_pref_e * v_mse_e + cur_pref_f * v_mse_f
+                              + cur_pref_v * v_mse_v)
+                v_rmse_e = np.sqrt(v_mse_e)
+                v_rmse_f = np.sqrt(v_mse_f)
+                v_rmse_v = np.sqrt(v_mse_v)
+                v_rmse_s = np.sqrt(v_mse_s) * EV_PER_A3_TO_GPa
             dt = time.time() - t_epoch
 
+            # With a validation set, the validation loss IS the run's loss:
+            # it drives the plateau scheduler, the best-model choice, and the
+            # displayed/logged "loss" value (the train RMSE columns remain).
+            sched_loss = valid_loss if valid_loss is not None else avg_loss
             if in_stage2 and stage2_scheduler is not None:
-                _scheduler_step(stage2_scheduler, avg_loss,
+                _scheduler_step(stage2_scheduler, sched_loss,
                                 lr_scheduler_mode, optimizer, stop_lr)
             elif not in_stage2:
-                _scheduler_step(lr_scheduler, avg_loss,
+                _scheduler_step(lr_scheduler, sched_loss,
                                 lr_scheduler_mode, optimizer, stop_lr)
 
+            # Early stopping (see train_nep). Every rank sees the identical
+            # all-reduced sched_loss, so all ranks stop on the same epoch —
+            # and, per-stage (MACE-style), all ranks jump into stage 2
+            # together when stage 1 plateaus with a stage 2 still pending.
+            stop_now = False
+            if early_stop:
+                if in_stage2 and not prev_in_stage2:
+                    es_best = float("inf")
+                    es_wait = 0
+                if sched_loss < es_best * (1.0 - 1e-4):
+                    es_best = sched_loss
+                    es_wait = 0
+                else:
+                    es_wait += 1
+                    if es_wait >= early_stop:
+                        if stage2 and not in_stage2:
+                            _log(f"Early stop (stage 1): {monitored} did "
+                                 f"not improve for {early_stop} epochs — "
+                                 f"starting stage 2 at epoch {epoch + 1} "
+                                 f"(was scheduled for epoch {start_stage2}).")
+                            start_stage2 = epoch + 1
+                            es_best = float("inf")
+                            es_wait = 0
+                        else:
+                            stop_now = True
+            prev_in_stage2 = in_stage2
+
             if is_main:
-                loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.6f} "
-                               f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}\n")
+                row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
+                       f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}")
+                if valid_loss is not None:
+                    row += (f" {v_rmse_e:.6f} {v_rmse_f:.6f} {v_rmse_v:.6f} "
+                            f"{v_rmse_s:.4f}")
+                loss_log.write(row + "\n")
                 loss_log.flush()
 
                 stage_str = "[S2] " if in_stage2 else ""
                 cur_lr = optimizer.param_groups[0]['lr']
                 v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
                          if has_virial else "")
-                line = (f"{stage_str}Epoch {epoch:4d} | loss {avg_loss:.4e} | "
+                valid_str = ""
+                if valid_loss is not None:
+                    valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
+                                 + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
+                                    if has_virial else ""))
+                line = (f"{stage_str}Epoch {epoch:4d} | "
+                        f"loss {sched_loss:.4e} | "
                         f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
-                        f"{v_str} | gnorm {max_gn:.1f} | "
+                        f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
                         f"lr {cur_lr:.2e} | {dt:.1f}s")
                 if epoch % print_interval == 0 or epoch == 1:
                     _log(line)
@@ -968,10 +1552,19 @@ def train_nep_sharded(
             new_min = avg_loss < best_loss
             if new_min:
                 best_loss = avg_loss
-            if epoch < true_eval_start:
+            if valid_store is not None:
+                # Valid-based selection: valid_loss is already a frozen-
+                # weight true evaluation (all-reduced, identical on every
+                # rank), so the noisy-proxy / true-eval two-step below is
+                # unnecessary. Only rank 0 writes the file.
+                if valid_loss < best_valid_loss:
+                    best_valid_loss = valid_loss
+                    if is_main:
+                        _save_best()
+            elif epoch < true_eval_start:
                 if new_min and is_main:
                     _save_best()
-            elif new_min or epoch == num_epochs:
+            elif new_min or epoch == num_epochs or stop_now:
                 local_sums = _accumulate_true_loss_sums(
                     data_store, batch_size, raw_model,
                     raw_model.compute_properties, _shim._compute_cached,
@@ -980,7 +1573,8 @@ def train_nep_sharded(
                 sums_t = torch.tensor(local_sums, device=dev,
                                       dtype=torch.float64)
                 dist.all_reduce(sums_t)
-                s_le, s_lf, s_lv, n_e, n_f, n_v, s_e_resid = sums_t.tolist()
+                (s_le, s_lf, s_lv, _s_ls,
+                 n_e, n_f, n_v, s_e_resid) = sums_t.tolist()
                 # Exact optimal b1 for these frozen weights, from the global
                 # (all-reduced) residual — identical on every rank.
                 delta = s_e_resid / n_e if n_e > 0 else 0.0
@@ -997,14 +1591,17 @@ def train_nep_sharded(
                         _save_best()
 
             if is_main and (epoch % checkpoint_interval == 0
-                            or epoch == num_epochs):
+                            or epoch == num_epochs or stop_now):
                 _save_checkpoint(
                     ckpt_path, raw_model, optimizer,
                     stage2_scheduler if in_stage2 else lr_scheduler,
                     epoch, best_loss, loss_weights=cur_loss_weights,
                     in_stage2=in_stage2,
                     swa_model=swa_model if in_stage2 else None,
-                    best_true_loss=best_true_loss)
+                    best_true_loss=best_true_loss, run_seed=run_seed,
+                    best_valid_loss=best_valid_loss,
+                    valid_info=cur_valid_info,
+                    start_stage2=start_stage2)
 
             # Interim predict — uses the CURRENT-epoch weights (not nep_best)
             # so the predict loss matches the line just logged for this epoch:
@@ -1022,8 +1619,20 @@ def train_nep_sharded(
                     raw_model, data_store, local_global_idx,
                     n_total_frames=n_total,
                     output_dir=output_dir,
-                    batch_size=batch_size, backend=backend,
-                    verbose=False)
+                    batch_size=batch_size, verbose=False)
+                if valid_store is not None:
+                    predict_from_store_sharded(
+                        raw_model, valid_store, valid_local_global_idx,
+                        n_total_frames=n_valid_total,
+                        output_dir=output_dir,
+                        batch_size=batch_size,
+                        verbose=False, suffix="test")
+
+            if stop_now:
+                _log(f"Early stop: {monitored} did not improve for "
+                     f"{early_stop} epochs (stopped at epoch {epoch}/"
+                     f"{num_epochs}).")
+                break
     finally:
         if is_main and loss_log is not None:
             loss_log.close()
@@ -1035,19 +1644,44 @@ def train_nep_sharded(
     if is_main:
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
                                max_NN_rad, max_NN_ang)
-        if swa_model is not None:
-            swa_state = swa_model.module.state_dict()
-            final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
-            raw_model.load_state_dict(swa_state)
+    if swa_model is not None and int(swa_model.n_averaged) == 0:
+        _log("SWA window never reached (run ended before swa_start) — "
+             "nep_average.txt not written")
+        swa_model = None
+    if swa_model is not None:
+        # All ranks: load the averaged weights and re-solve b1 from the
+        # GLOBAL energy residual (b1's per-epoch analytic values were
+        # averaged along the trajectory — a stale offset for the averaged
+        # weights; see train_nep). Energy-only pass over each shard,
+        # all-reduced.
+        swa_state = swa_model.module.state_dict()
+        final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
+        raw_model.load_state_dict(swa_state)
+        b1_sums = _accumulate_true_loss_sums(
+            data_store, batch_size, raw_model,
+            raw_model.compute_properties, _shim._compute_cached,
+            use_autograd_forces, train_backend, False, False, dtype, dev)
+        b1_t = torch.tensor([b1_sums[7], float(b1_sums[4])], device=dev,
+                            dtype=torch.float64)
+        dist.all_reduce(b1_t)
+        delta = (b1_t[0] / b1_t[1]).item() if b1_t[1] > 0 else 0.0
+        with torch.no_grad():
+            raw_model.b1.add_(delta)
+        if is_main:
             raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                    max_NN_rad, max_NN_ang)
-            raw_model.load_state_dict(final_state)
-            _log("SWA model saved to nep_average.txt")
+            _log("SWA model saved to nep_average.txt (b1 re-solved for the "
+                 "averaged weights)")
+        raw_model.load_state_dict(final_state)
 
         train_time = time.time() - train_t0
         h, rem = divmod(train_time, 3600)
         m_, s = divmod(rem, 60)
-        _log(f"\nDone. Best loss: {best_loss:.6e}")
+        if valid_store is not None:
+            _log(f"\nDone. Best validation loss (nep_best): "
+                 f"{best_valid_loss:.6e}")
+        else:
+            _log(f"\nDone. Best loss: {best_loss:.6e}")
         _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
         _log("\nRunning prediction on training set (final-epoch model)...")
@@ -1061,13 +1695,19 @@ def train_nep_sharded(
         raw_model, data_store, local_global_idx,
         n_total_frames=n_total,
         output_dir=output_dir,
-        batch_size=batch_size, backend=backend,
-        verbose=is_main)
+        batch_size=batch_size, verbose=is_main)
+    if valid_store is not None:
+        predict_from_store_sharded(
+            raw_model, valid_store, valid_local_global_idx,
+            n_total_frames=n_valid_total,
+            output_dir=output_dir,
+            batch_size=batch_size, verbose=False,
+            suffix="test")
     if is_main:
         _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
     # data_store is no longer needed — free it now that predict is done.
-    del data_store
+    del data_store, valid_store
     if dev.type == "cuda":
         torch.cuda.empty_cache()
 

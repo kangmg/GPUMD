@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """End-to-end parity with GPUMD, plus gradient self-consistency.
 
@@ -48,7 +48,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent))
 
 from torchnep import ops, predict_dataset
-from torchnep.data import read_xyz, build_neighbor_list_np
+from torchnep.data import read_xyz, build_neighbor_list_np, pair_cutoff_np
 from torchnep.nep import NEPCalculator
 from torchnep.model import NEPModel
 from _common import (DTYPE_MAP, NP_DTYPE_MAP, DATA_DIR, FIXTURES, devices,
@@ -63,8 +63,10 @@ from _common import (DTYPE_MAP, NP_DTYPE_MAP, DATA_DIR, FIXTURES, devices,
 def _preprocess_for_prediction(frames, calc, np_dtype):
     """Build neighbor lists for a list of frames. Returns structure dicts
     with the same schema the training pipeline produces."""
-    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
-    max_rc = max(rc_rad, rc_ang)
+    max_rc = max(calc.rc_radial, calc.rc_angular)
+    rc_rad, rc_ang = calc.cutoff_args()
+    if isinstance(rc_rad, torch.Tensor):       # per-species: (T, T) tables
+        rc_rad, rc_ang = rc_rad.cpu().numpy(), rc_ang.cpu().numpy()
 
     structures = []
     for frame in frames:
@@ -75,15 +77,17 @@ def _preprocess_for_prediction(frames, calc, np_dtype):
             dtype=np.int64)
         pair_i, pair_j, rij = build_neighbor_list_np(positions, cell, max_rc)
         dij = np.linalg.norm(rij, axis=1)
+        m_r = dij < pair_cutoff_np(rc_rad, atom_types, pair_i, pair_j)
+        m_a = dij < pair_cutoff_np(rc_ang, atom_types, pair_i, pair_j)
         structures.append({
             "natoms": frame["natoms"],
             "atom_types": atom_types,
-            "pair_i_rad": pair_i[dij < rc_rad],
-            "pair_j_rad": pair_j[dij < rc_rad],
-            "rij_rad":    rij[dij < rc_rad],
-            "pair_i_ang": pair_i[dij < rc_ang],
-            "pair_j_ang": pair_j[dij < rc_ang],
-            "rij_ang":    rij[dij < rc_ang],
+            "pair_i_rad": pair_i[m_r],
+            "pair_j_rad": pair_j[m_r],
+            "rij_rad":    rij[m_r],
+            "pair_i_ang": pair_i[m_a],
+            "pair_j_ang": pair_j[m_a],
+            "rij_ang":    rij[m_a],
             "energy": frame.get("energy"),
             "forces": frame.get("forces"),
             "virial": frame.get("virial"),
@@ -94,7 +98,7 @@ def _preprocess_for_prediction(frames, calc, np_dtype):
 def _build_batch(structures, indices, calc, dtype, device):
     """Collate a list of structure indices into a GPU batch with cached basis,
     matching the dict shape NEPCalculator.compute_batch expects."""
-    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
+    rc_rad, rc_ang = calc.cutoff_args()
     basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
     l_max_3b, num_lm = calc.l_max_3b, calc.num_lm
 
@@ -129,12 +133,14 @@ def _build_batch(structures, indices, calc, dtype, device):
     rij_a = _cat_rij("rij_ang")
 
     dr = torch.norm(rij_r, dim=-1)
-    fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
+    fk_r, fkp_r = ops.chebyshev_basis_and_deriv(
+        dr, ops.pair_cutoff(rc_rad, atom_types, pi_r, pj_r), basis_r)
     d12inv_r = 1.0 / dr.clamp(min=1e-10)
 
     if rij_a.shape[0] > 0:
         da = torch.norm(rij_a, dim=-1)
-        fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, rc_ang, basis_a)
+        fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
+            da, ops.pair_cutoff(rc_ang, atom_types, pi_a, pj_a), basis_a)
         d12inv_a = 1.0 / da.clamp(min=1e-10)
         blm = ops.angular_basis(rij_a[:, 0] * d12inv_a,
                                 rij_a[:, 1] * d12inv_a,
@@ -282,6 +288,8 @@ def _model_from_calc(calc: NEPCalculator, device) -> NEPModel:
         "num_types":           calc.num_types,
         "cutoff_radial":       calc.rc_radial,
         "cutoff_angular":      calc.rc_angular,
+        "cutoff_radial_per_type":  calc.rc_radial_per_type,
+        "cutoff_angular_per_type": calc.rc_angular_per_type,
         "n_max_radial":        calc.n_max_radial,
         "n_max_angular":       calc.n_max_angular,
         "basis_size_radial":   calc.basis_size_radial,
@@ -294,6 +302,8 @@ def _model_from_calc(calc: NEPCalculator, device) -> NEPModel:
         config["zbl"] = calc.zbl_rc_outer
         if calc.zbl_typewise_factor is not None:
             config["typewise_cutoff_zbl_factor"] = calc.zbl_typewise_factor
+        if getattr(calc, "zbl_flexible", False):
+            config["zbl_flexible"] = calc.zbl_table.tolist()   # per-pair table from nep.txt
 
     model = NEPModel(config).to(calc.dtype).to(device)
     for t in range(calc.num_types):
@@ -378,3 +388,38 @@ def test_output_parity_with_gpumd(device, tmp_path):
     assert np.all(t_str[1, 6:] == -1e6)
     # Explicit sign check: predicted stress shares the predicted virial's sign.
     assert np.array_equal(np.sign(t_str[:, :6]), np.sign(t_vir[:, :6]))
+
+
+_SHARDED_PREDICT_RUNNER = """
+import sys
+from torchnep import predict_dataset_sharded
+predict_dataset_sharded(sys.argv[1], sys.argv[2], output_dir=sys.argv[3], dtype="float64", verbose=False)
+"""
+
+
+def test_predict_dataset_sharded_matches_single(tmp_path):
+    """2-rank predict_dataset_sharded (CPU/gloo via torchrun) writes the same
+    *_train.out files as predict_dataset. Opt-in like the DDP training test:
+    TORCHNEP_TEST_DDP=1 pytest tests/test_gpumd_parity.py -k sharded"""
+    import os, shutil, subprocess
+    if os.environ.get("TORCHNEP_TEST_DDP") != "1":
+        pytest.skip("multi-process test is local-only (set TORCHNEP_TEST_DDP=1)")
+    from _common import torchrun_cmd
+    cmd = torchrun_cmd(2)
+    if not cmd:
+        pytest.skip("torchrun not on PATH")
+    frames = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))
+    xyz = tmp_path / "virial_mix.xyz"
+    write_virial_mix_xyz(frames, xyz)
+    model = str(DATA_DIR / "nep_CrCoNi.txt")
+    predict_dataset(model, str(xyz), output_dir=str(tmp_path / "single"), dtype="float64",
+                    device="cpu", verbose=False, chunk_atoms=1)   # one frame per chunk
+    runner = tmp_path / "runner.py"; runner.write_text(_SHARDED_PREDICT_RUNNER)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="",
+               PYTHONPATH=str(DATA_DIR.parent.parent) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    r = subprocess.run(cmd + [str(runner), model, str(xyz), str(tmp_path / "sharded")],
+                       capture_output=True, text=True, env=env, timeout=600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    for name in ("energy_train.out", "force_train.out", "virial_train.out", "stress_train.out"):
+        a = np.loadtxt(tmp_path / "single" / name); b = np.loadtxt(tmp_path / "sharded" / name)
+        assert a.shape == b.shape and np.allclose(a, b, rtol=1e-6, atol=1e-6), name

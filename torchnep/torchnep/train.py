@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 NEP training with PyTorch — single-GPU / CPU entry point.
@@ -40,8 +40,11 @@ from datetime import datetime
 from typing import List, Dict
 from torch.optim.swa_utils import AveragedModel
 
-from .model import NEPModel, slim_model
-from .data import read_xyz, parse_nep_in, build_neighbor_list_np
+from .model import NEPModel, slim_model, gpumd_init_parameters
+from .data import (read_xyz, parse_nep_in, valid_split_indices,
+                   stratified_split_indices, build_neighbor_list_np,
+                   build_neighbor_list_np_ex, wrap_positions, image_repeats,
+                   cutoff_pair_table, pair_cutoff_np)
 from . import ops
 from . import __version__
 from .predict import predict_from_store
@@ -140,8 +143,13 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append("------------------")
     lines.append(f"  {tag('type_names', 'num_types'):10}  types        "
                  f"{config['num_types']}  {' '.join(config['type_names'])}")
-    lines.append(f"  {tag('cutoff_radial', 'cutoff_angular'):10}  cutoff       "
-                 f"{config['cutoff_radial']} {config['cutoff_angular']}")
+    if config.get("cutoff_radial_per_type") is not None:
+        cut = " ".join(f"{r:g} {a:g}" for r, a in zip(config["cutoff_radial_per_type"],
+                                                     config["cutoff_angular_per_type"]))
+        cut += "  (per species: pair cutoff = mean of the two)"
+    else:
+        cut = f"{config['cutoff_radial']} {config['cutoff_angular']}"
+    lines.append(f"  {tag('cutoff_radial', 'cutoff_angular'):10}  cutoff       {cut}")
     lines.append(f"  {tag('n_max_radial', 'n_max_angular'):10}  n_max        "
                  f"{config['n_max_radial']} {config['n_max_angular']}")
     lines.append(f"  {tag('basis_size_radial', 'basis_size_angular'):10}  "
@@ -154,9 +162,13 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append(f"  {tag('neuron'):10}  neuron       {config['neuron']}")
     if config.get("zbl") is not None:
         zbl_extra = ""
-        if config.get("typewise_cutoff_zbl_factor") is not None:
-            zbl_extra = f"  typewise factor {config['typewise_cutoff_zbl_factor']}"
-        lines.append(f"  {tag('zbl'):10}  zbl          {config['zbl']}{zbl_extra}")
+        if config.get("zbl_flexible") is not None:
+            lines.append(f"  {tag('zbl'):10}  zbl          flexible, per-pair "
+                         f"parameters from {config.get('zbl_file', 'zbl.in')}")
+        else:
+            if config.get("typewise_cutoff_zbl_factor") is not None:
+                zbl_extra = f"  typewise factor {config['typewise_cutoff_zbl_factor']}"
+            lines.append(f"  {tag('zbl'):10}  zbl          {config['zbl']}{zbl_extra}")
 
     lines.append("")
     lines.append("Training schedule (Stage 1)")
@@ -175,17 +187,13 @@ def format_config_summary(config: dict) -> List[str]:
                  f"{config['scheduler_patience']}")
     lines.append(f"  {tag('scheduler_factor'):10}  factor       "
                  f"{config['scheduler_factor']}")
-    if "early_stop_patience" in config:
-        lines.append(f"  {tag('early_stop_patience'):10}  early_stop   "
-                     f"{config['early_stop_patience']} epochs with no true-loss improvement")
     lines.append(f"  {tag('max_grad_norm'):10}  max_grad     {config['max_grad_norm']}")
     lines.append(f"  {tag('lambda_e'):10}  lambda_e     {config['lambda_e']}")
     lines.append(f"  {tag('lambda_f'):10}  lambda_f     {config['lambda_f']}")
     lines.append(f"  {tag('lambda_v'):10}  lambda_v     {config['lambda_v']}")
-    if config.get("lambda_1", 0.0) or config.get("lambda_2", 0.0):
-        lines.append(f"  {tag('lambda_1'):10}  lambda_1     {config['lambda_1']}")
-        lines.append(f"  {tag('lambda_2'):10}  lambda_2     {config['lambda_2']}")
-
+    if config.get("weight_decay", 0.0):
+        lines.append(f"  {tag('weight_decay'):10}  weight_decay "
+                     f"{config['weight_decay']}")
     if config.get("stage2"):
         lines.append("")
         lines.append("Training schedule (Stage 2)")
@@ -212,90 +220,95 @@ def format_config_summary(config: dict) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# GPU data store — all data pre-loaded to device
+# Data store — host-resident, batches streamed to the device
 # ---------------------------------------------------------------------------
 
-def _basis_chunk_size(device, dtype, basis_size_angular, num_lm, l_max_3b,
-                      min_chunk=1 << 16, max_chunk=1 << 23):
-    """Pairs-per-chunk for the cached-basis precompute in ``GPUDataStore``.
+class StreamDataStore:
+    """The training data store: host-resident, GPU memory scales with batch
+    size only.
 
-    The basis is built in chunks so the transient working set is one chunk
-    instead of the whole shard — this lowers the construction-time GPU memory
-    peak (which otherwise sits well above the steady training footprint and
-    needlessly caps how big a shard each rank can hold). Results are unchanged:
-    the Chebyshev/angular bases are per-pair elementwise, so chunking is
-    bit-identical to the one-shot path.
+    Every per-structure array stays in host memory. ``collate(indices)``
+    assembles the requested frames on the CPU, copies just that batch to the
+    device (via a pinned staging copy so the H2D transfer is async), and
+    computes the Chebyshev/angular basis for the batch on the fly. The
+    background-prefetch iteration in ``iter_collated`` plus the pinned async
+    copies hide the streaming work behind the device compute — benchmarks
+    across 1-16 element types showed speed parity with a fully preloaded
+    GPU store (which this class replaced) at ~10-15x less GPU memory, so
+    streaming is the only data path.
 
-    The chunk is sized so one chunk's transient stays within a small fixed
-    budget (``TARGET`` below, ~512 MB) — the whole point is to keep the peak
-    just above the steady footprint, not to go as fast as possible. On CUDA the
-    budget is additionally clamped to a fraction of the memory still *free*
-    after the persistent basis buffers are allocated (queried via
-    ``mem_get_info``), so a memory-tight card shrinks the chunk further rather
-    than OOM-ing. On CPU only the fixed budget applies. Bigger chunks make
-    ``__init__`` faster; they never affect training speed (training reads the
-    same split-view layout either way).
-    """
-    elem = 8 if dtype == torch.float64 else 4
-    # Generous per-pair transient estimate: Chebyshev scratch (~14 vectors),
-    # angular z/Re/Im powers + the blm list and its torch.stack copy
-    # (~2*num_lm + 4*(l+1)), plus margin. Over-estimating only shrinks the
-    # chunk, which is safe.
-    per_pair = elem * (2 * (basis_size_angular + 1) + 2 * num_lm
-                       + 4 * (l_max_3b + 1) + 40)
-    TARGET = 512 * 1024 * 1024  # ~512 MB transient budget per chunk
-    budget = TARGET
-    if device.type == "cuda":
-        try:
-            free, _ = torch.cuda.mem_get_info(device)
-            # Never let the transient eat more than half of what's free, so a
-            # tight card shrinks the chunk instead of OOM-ing at build time.
-            budget = min(TARGET, int(free * 0.5))
-        except Exception:
-            budget = min(TARGET, 256 * 1024 * 1024)
-    chunk = budget // max(per_pair, 1)
-    return max(min_chunk, min(max_chunk, chunk))
-
-
-class GPUDataStore:
-    """Pre-loads all structure data to GPU for zero-copy batch collation.
-
-    When ``config`` is given, also caches Chebyshev basis functions and
-    angular basis on GPU so training never recomputes them.
+    The per-batch basis is chunking-invariant per-pair elementwise math, so
+    every batch is bit-identical no matter how the dataset is batched.
     """
 
     def __init__(self, structures: List[Dict], device: torch.device,
-                 dtype: torch.dtype, config: dict = None):
+                 dtype: torch.dtype, config: dict = None,
+                 neighbor_mode: str = "cached"):
+        """Build the store from preprocessed ``structures``.
+
+        The per-frame pair / geometry arrays are MOVED into the store's
+        concatenated tensors (popped from the dicts one frame at a time),
+        so the peak host memory is one copy of the data, not two. Callers
+        that still need those per-frame arrays must pass a copy.
+        """
+        if config is None:
+            raise ValueError("StreamDataStore requires config (it computes "
+                             "the cached basis per batch)")
+        if neighbor_mode not in NEIGHBOR_MODES:
+            raise ValueError(f"neighbor_mode {neighbor_mode!r} not in "
+                             f"{NEIGHBOR_MODES}")
         self.device = device
         self.dtype = dtype
         self.n = len(structures)
-        self.has_cached_basis = config is not None
+        self.has_cached_basis = True
+        self._pin = device.type == "cuda"
+        self.neighbor_mode = neighbor_mode
 
-        n_rad = np.array([len(s["pair_i_rad"]) for s in structures], dtype=np.int64)
-        n_ang = np.array([len(s["pair_i_ang"]) for s in structures], dtype=np.int64)
+        # Basis parameters (needed at collate time). _rc_r / _rc_a are the
+        # largest cutoffs (device neighbor search radius); with per-species
+        # cutoffs the (T, T) pair tables give each pair's own value.
+        self._rc_r = config["cutoff_radial"]
+        self._rc_a = config["cutoff_angular"]
+        self._rc_r_tab = self._rc_a_tab = None
+        if config.get("cutoff_radial_per_type") is not None:
+            self._rc_r_tab = torch.tensor(
+                cutoff_pair_table(config["cutoff_radial_per_type"]),
+                dtype=dtype, device=device)
+            self._rc_a_tab = torch.tensor(
+                cutoff_pair_table(config["cutoff_angular_per_type"]),
+                dtype=dtype, device=device)
+        self._bs_r = config["basis_size_radial"]
+        self._bs_a = config["basis_size_angular"]
+        self._l3 = config["l_max"][0]
+        self._num_lm = (sum(2 * ll + 1 for ll in range(1, self._l3 + 1))
+                        if self._l3 >= 1 else 0)
+        self._basis_fn = self._basis_impl  # swapped by compile_basis()
+
         self.natoms = [int(s["natoms"]) for s in structures]
+        self._nat = np.asarray(self.natoms, dtype=np.int64)
+        self._nat_cum = np.concatenate([[0], np.cumsum(self._nat)])
 
-        # preprocess_structures already returns arrays with the right dtype
-        # (int64 for indices, float32 for rij). Skip the defensive astype —
-        # it was creating an extra copy of every per-frame array.
-        at_cat   = np.concatenate([s["atom_types"]  for s in structures])
-        pi_r_cat = np.concatenate([s["pair_i_rad"]  for s in structures])
-        pj_r_cat = np.concatenate([s["pair_j_rad"]  for s in structures])
-        rij_r_cat = np.concatenate([s["rij_rad"]    for s in structures])
-        pi_a_cat = np.concatenate([s["pair_i_ang"]  for s in structures])
-        pj_a_cat = np.concatenate([s["pair_j_ang"]  for s in structures])
-        rij_a_cat = np.concatenate([s["rij_ang"]    for s in structures])
-
-        at_all   = torch.from_numpy(at_cat).to(device=device, non_blocking=True)
-
-        pi_r_all = torch.from_numpy(pi_r_cat).to(device=device, non_blocking=True)
-        pj_r_all = torch.from_numpy(pj_r_cat).to(device=device, non_blocking=True)
-        rij_r_all = torch.from_numpy(rij_r_cat).to(device=device, dtype=dtype,
-                                                    non_blocking=True)
-        pi_a_all = torch.from_numpy(pi_a_cat).to(device=device, non_blocking=True)
-        pj_a_all = torch.from_numpy(pj_a_cat).to(device=device, non_blocking=True)
-        rij_a_all = torch.from_numpy(rij_a_cat).to(device=device, dtype=dtype,
-                                                    non_blocking=True)
+        # One concatenated CPU tensor per field (frame order); collate
+        # slices them via the cumulative offsets above.
+        self._at_all = torch.from_numpy(
+            np.concatenate([s["atom_types"] for s in structures]))
+        if neighbor_mode == "cached":
+            self._init_pairs_cached(structures)
+        else:
+            self._init_geometry(structures)
+            if neighbor_mode == "compact":
+                self._init_pairs_compact(structures)
+            else:
+                # Neighbor counts are only known once the device search
+                # has run (scan_max_neighbors); until then they are
+                # reported as 0 so callers can fold them in later.
+                self._max_nn = None
+        # on_the_fly on CUDA/ROCm: the device search (whose ``nonzero``
+        # must synchronise) runs on a side stream inside the prefetch
+        # thread, so its sync never stalls the training thread's kernel
+        # launches; the main stream waits on an event instead.
+        self._side_stream = (torch.cuda.Stream(device)
+                             if device.type == "cuda" else None)
 
         self.energy = [float(s["energy"]) if "energy" in s else 0.0
                        for s in structures]
@@ -303,116 +316,53 @@ class GPUDataStore:
         self.has_forces_flag = ["forces" in s for s in structures]
         self.has_virial_flag = ["virial" in s for s in structures]
 
+        np_dtype = np.float32 if dtype == torch.float32 else np.float64
         f_parts = []
         for s in structures:
             if "forces" in s:
                 f_parts.append(np.asarray(s["forces"]).reshape(-1, 3))
             else:
-                f_parts.append(np.zeros((s["natoms"], 3), dtype=np.float32))
-        f_cat = np.concatenate(f_parts).astype(np.float32 if dtype == torch.float32
-                                               else np.float64, copy=False)
-        f_all = torch.from_numpy(f_cat).to(device=device, dtype=dtype,
-                                            non_blocking=True)
+                f_parts.append(np.zeros((s["natoms"], 3), dtype=np_dtype))
+        self._f_all = torch.from_numpy(
+            np.concatenate(f_parts).astype(np_dtype, copy=False))
 
         v_parts = []
         for s in structures:
             if "virial" in s:
                 v = np.asarray(s["virial"]).reshape(-1)
                 if v.shape[0] == 6:
-                    v9 = np.array([v[0], v[3], v[5],
-                                   v[3], v[1], v[4],
-                                   v[5], v[4], v[2]])
-                    v_parts.append(v9)
+                    v_parts.append(np.array([v[0], v[3], v[5],
+                                             v[3], v[1], v[4],
+                                             v[5], v[4], v[2]]))
                 else:
                     v_parts.append(v[:9])
             else:
                 v_parts.append(np.zeros(9))
-        v_cat = np.stack(v_parts).astype(np.float32 if dtype == torch.float32
-                                         else np.float64, copy=False)
-        v_all = torch.from_numpy(v_cat).to(device=device, dtype=dtype,
-                                            non_blocking=True)
+        self._v_all = torch.from_numpy(
+            np.stack(v_parts).astype(np_dtype, copy=False))
 
-        # Per-frame cell volume (A**3) — needed for stress RMSE. Same order as
-        # frames, so a batch slice follows the same indexing as .energy etc.
+        # Per-frame CPU views — predict_from_store reads
+        # ``data_store.forces[i].cpu()`` / ``.virial[i].cpu()`` (no-ops on
+        # these CPU views).
+        self.forces = list(torch.split(self._f_all, self.natoms))
+        self.virial = list(torch.unbind(self._v_all, dim=0))
+
+        # Device copy is kept for predict_from_store (which calls .cpu() on
+        # it); collate gathers from the CPU copy and ships the gathered
+        # slice through the same pinned/async channel as every other field —
+        # indexing the device copy with a pageable index tensor would force
+        # a full compute-stream drain per batch (a hidden ~5-10 ms/step
+        # sync, the single largest pipeline stall found by profiling).
         vol_cat = np.asarray([s.get("volume", 0.0) for s in structures],
-                             dtype=np.float32 if dtype == torch.float32
-                             else np.float64)
-        self.volumes = torch.from_numpy(vol_cat).to(device=device, dtype=dtype,
-                                                     non_blocking=True)
+                             dtype=np_dtype)
+        self._vol_cpu = torch.from_numpy(vol_cat).to(dtype)
+        self.volumes = self._vol_cpu.to(device=device)
 
-        if config is not None:
-            # Build the cached basis in pair-chunks, writing into preallocated
-            # buffers. The transient working set is then one chunk, not the
-            # whole shard — this caps the construction-time GPU memory peak so
-            # it stays close to the steady training footprint. Chebyshev and
-            # angular bases are per-pair elementwise, so this is bit-identical
-            # to computing them in one shot; only __init__ does more work, the
-            # training step (which reads the split views below) is unchanged.
-            rc_r = config["cutoff_radial"]
-            rc_a = config["cutoff_angular"]
-            bs_r = config["basis_size_radial"]
-            bs_a = config["basis_size_angular"]
-            l3 = config["l_max"][0]
-            num_lm = sum(2 * ll + 1 for ll in range(1, l3 + 1)) if l3 >= 1 else 0
-
-            P_r = rij_r_all.shape[0]
-            fk_r_all = torch.empty(P_r, bs_r + 1, dtype=dtype, device=device)
-            fkp_r_all = torch.empty(P_r, bs_r + 1, dtype=dtype, device=device)
-            d12inv_r_all = torch.empty(P_r, dtype=dtype, device=device)
-
-            P_a = rij_a_all.shape[0]
-            fk_a_all = torch.empty(P_a, bs_a + 1, dtype=dtype, device=device)
-            fkp_a_all = torch.empty(P_a, bs_a + 1, dtype=dtype, device=device)
-            d12inv_a_all = torch.empty(P_a, dtype=dtype, device=device)
-            blm_all = torch.empty(P_a, num_lm, dtype=dtype, device=device)
-
-            # Chunk sized against memory still free *after* the buffers above.
-            chunk = _basis_chunk_size(device, dtype, bs_a, num_lm, l3)
-
-            for st in range(0, P_r, chunk):
-                en = min(st + chunk, P_r)
-                dr = torch.norm(rij_r_all[st:en], dim=-1)
-                fk, fkp = ops.chebyshev_basis_and_deriv(dr, rc_r, bs_r)
-                fk_r_all[st:en] = fk
-                fkp_r_all[st:en] = fkp
-                d12inv_r_all[st:en] = 1.0 / dr
-
-            for st in range(0, P_a, chunk):
-                en = min(st + chunk, P_a)
-                rij = rij_a_all[st:en]
-                da = torch.norm(rij, dim=-1)
-                fk, fkp = ops.chebyshev_basis_and_deriv(da, rc_a, bs_a)
-                fk_a_all[st:en] = fk
-                fkp_a_all[st:en] = fkp
-                dinv = 1.0 / da
-                d12inv_a_all[st:en] = dinv
-                if num_lm > 0:
-                    blm_all[st:en] = ops.angular_basis(
-                        rij[:, 0] * dinv, rij[:, 1] * dinv,
-                        rij[:, 2] * dinv, l3)
-
-        nr_list = n_rad.tolist()
-        na_list = n_ang.tolist()
-        nat_list = [int(x) for x in self.natoms]
-
-        self.atom_types = list(torch.split(at_all, nat_list))
-        self.pi_rad = list(torch.split(pi_r_all, nr_list))
-        self.pj_rad = list(torch.split(pj_r_all, nr_list))
-        self.rij_rad = list(torch.split(rij_r_all, nr_list))
-        self.pi_ang = list(torch.split(pi_a_all, na_list))
-        self.pj_ang = list(torch.split(pj_a_all, na_list))
-        self.rij_ang = list(torch.split(rij_a_all, na_list))
-        self.forces = list(torch.split(f_all, nat_list))
-        self.virial = list(torch.unbind(v_all, dim=0))
-
-        if config is not None:
-            self.fk_rad = list(torch.split(fk_r_all, nr_list))
-            self.fkp_rad = list(torch.split(fkp_r_all, nr_list))
-            self.d12inv_rad = list(torch.split(d12inv_r_all, nr_list))
-            self.fk_ang = list(torch.split(fk_a_all, na_list))
-            self.fkp_ang = list(torch.split(fkp_a_all, na_list))
-            self.d12inv_ang = list(torch.split(d12inv_a_all, na_list))
-            self.blm = list(torch.split(blm_all, na_list))
+        self._e_flag_t = torch.tensor(self.has_energy_flag, dtype=torch.bool)
+        self._f_flag_t = torch.tensor(self.has_forces_flag, dtype=torch.bool)
+        self._v_flag_t = torch.tensor(self.has_virial_flag, dtype=torch.bool)
+        self._energy_t = torch.tensor(self.energy, dtype=dtype)
+        self._nat_t = torch.from_numpy(self._nat)
 
         self.n_energy = sum(self.has_energy_flag)
         self.n_forces = sum(self.has_forces_flag)
@@ -420,103 +370,587 @@ class GPUDataStore:
         self.has_forces = self.n_forces > 0
         self.has_virial = self.n_virial > 0
 
-    def collate(self, indices: List[int]) -> Dict:
-        """Fast GPU-side batch collation. No CPU->GPU transfer."""
-        offsets = [0]
-        for i in indices:
-            offsets.append(offsets[-1] + self.natoms[i])
-        N_total = offsets[-1]
-        B = len(indices)
+    def _cat(self, t, indices, cum):
+        """Concatenate the per-frame slices of ``t`` for ``indices`` (CPU)."""
+        return torch.cat([t[cum[i]:cum[i + 1]] for i in indices])
 
-        at_list = [self.atom_types[i] for i in indices]
-        atom_types = torch.cat(at_list)
+    def _to_dev(self, t):
+        """Host -> device via pinned staging (async under the CUDA caching
+        host allocator, which defers reuse of the staging block until the
+        copy's recorded event completes)."""
+        if self._pin:
+            return t.pin_memory().to(self.device, non_blocking=True)
+        return t.to(self.device)
 
-        struct_idx = torch.cat([
-            torch.full((self.natoms[i],), k, dtype=torch.long,
-                       device=self.device)
-            for k, i in enumerate(indices)
-        ])
+    # ---- per-mode storage --------------------------------------------------
+    @staticmethod
+    def _gather_free(structures, key, total, np_dtype=None, drop=()):
+        """Concatenate ``structures[i][key]`` into one preallocated array,
+        releasing each frame's array as soon as it is copied (``drop`` names
+        further keys to release alongside, e.g. views of the same array).
+        Peak host memory is then 1x the field instead of the 2x that a
+        concatenate-then-discard would need — the difference between fitting
+        and OOM on a single node with a many-million-frame shard."""
+        first = structures[0][key]
+        np_dtype = np_dtype or first.dtype
+        out = np.empty((total,) + tuple(first.shape[1:]), dtype=np_dtype)
+        pos = 0
+        for s in structures:
+            a = s.pop(key)
+            n = len(a)
+            out[pos:pos + n] = a
+            pos += n
+            for k in drop:
+                s.pop(k, None)
+        return torch.from_numpy(out)
 
-        pi_r = torch.cat([self.pi_rad[i] + offsets[k]
-                          for k, i in enumerate(indices)])
-        pj_r = torch.cat([self.pj_rad[i] + offsets[k]
-                          for k, i in enumerate(indices)])
-        rij_r = torch.cat([self.rij_rad[i] for i in indices])
-        pi_a = torch.cat([self.pi_ang[i] + offsets[k]
-                          for k, i in enumerate(indices)])
-        pj_a = torch.cat([self.pj_ang[i] + offsets[k]
-                          for k, i in enumerate(indices)])
-        rij_a = torch.cat([self.rij_ang[i] for i in indices])
+    def _init_pairs_cached(self, structures):
+        """Full radial + angular pair lists with displacement vectors."""
+        self._nrad = np.asarray([len(s["pair_i_rad"]) for s in structures],
+                                dtype=np.int64)
+        self._nang = np.asarray([len(s["pair_i_ang"]) for s in structures],
+                                dtype=np.int64)
+        self._nrad_cum = np.concatenate([[0], np.cumsum(self._nrad)])
+        self._nang_cum = np.concatenate([[0], np.cumsum(self._nang)])
+        np_dtype = np.float32 if self.dtype == torch.float32 else np.float64
+        nr, na = int(self._nrad.sum()), int(self._nang.sum())
+        g = self._gather_free
+        # int32 indices (frame-local, < 2^31); widened to int64 per batch
+        self._pi_r_all = g(structures, "pair_i_rad", nr, np.int32)
+        self._pj_r_all = g(structures, "pair_j_rad", nr, np.int32)
+        self._rij_r_all = g(structures, "rij_rad", nr, np_dtype)
+        self._pi_a_all = g(structures, "pair_i_ang", na, np.int32)
+        self._pj_a_all = g(structures, "pair_j_ang", na, np.int32)
+        self._rij_a_all = g(structures, "rij_ang", na, np_dtype)
 
-        energy = torch.tensor([self.energy[i] for i in indices],
-                              dtype=self.dtype, device=self.device)
-        natoms = torch.tensor([self.natoms[i] for i in indices],
-                              dtype=self.dtype, device=self.device)
+    def _init_geometry(self, structures):
+        """Wrapped positions (per atom) and cells (per frame) — the inputs of
+        the device-side displacement / neighbor computation."""
+        np_dtype = np.float32 if self.dtype == torch.float32 else np.float64
+        self._pos_all = self._gather_free(structures, "positions",
+                                          int(self._nat.sum()), np_dtype)
+        self._cell_all = torch.from_numpy(np.stack(
+            [np.asarray(s.pop("cell"), dtype=np_dtype) for s in structures]))
 
-        volumes = self.volumes[torch.as_tensor(indices, device=self.device,
-                                                dtype=torch.long)]
+    def _init_pairs_compact(self, structures):
+        """One int32 pair list per frame (angular pairs first) + int8 image
+        shifts; ``rij`` is rebuilt on the device from the geometry."""
+        self._nrad = np.asarray([len(s["pair_i_rad"]) for s in structures],
+                                dtype=np.int64)
+        self._nang = np.asarray([int(s["n_ang"]) for s in structures],
+                                dtype=np.int64)
+        self._nrad_cum = np.concatenate([[0], np.cumsum(self._nrad)])
+        nr = int(self._nrad.sum())
+        g = self._gather_free
+        # pair_i_ang is a view of pair_i_rad: drop it with its base array
+        self._pi_all = g(structures, "pair_i_rad", nr, np.int32,
+                         drop=("pair_i_ang",))
+        self._pj_all = g(structures, "pair_j_rad", nr, np.int32)
+        self._sh_all = g(structures, "shift_rad", nr, np.int8)
 
-        batch = {
-            "N": N_total, "num_structures": B,
-            "atom_types": atom_types, "struct_idx": struct_idx,
-            "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
-            "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
-            "energy": energy, "natoms": natoms, "volumes": volumes,
+    def memory_bytes(self) -> int:
+        """Host bytes held by the pair / geometry tensors of this store."""
+        names = {"cached": ("_pi_r_all", "_pj_r_all", "_rij_r_all",
+                            "_pi_a_all", "_pj_a_all", "_rij_a_all"),
+                 "compact": ("_pi_all", "_pj_all", "_sh_all", "_pos_all",
+                             "_cell_all"),
+                 "on_the_fly": ("_pos_all", "_cell_all")}[self.neighbor_mode]
+        return sum(getattr(self, n).numel() * getattr(self, n).element_size()
+                   for n in names)
+
+    # ---- device-side geometry ---------------------------------------------
+    def _rij_from_shifts(self, pos, pi, pj, shift, cell_b, struct_idx):
+        """``rij = pos[j] + shift @ cell[frame] - pos[i]`` for a batch
+        (same association order as the numpy builder)."""
+        cell_p = cell_b[struct_idx[pi]]                         # (P, 3, 3)
+        sh = shift.to(self.dtype)
+        # elementwise (not einsum/bmm: a batch of P tiny 1x3 @ 3x3 products
+        # is a pathological GEMM shape on ROCm)
+        sc = (sh[:, 0:1] * cell_p[:, 0, :] + sh[:, 1:2] * cell_p[:, 1, :]
+              + sh[:, 2:3] * cell_p[:, 2, :])
+        return (pos[pj] + sc) - pos[pi]
+
+    def _pair_rc(self, atom_types, pi, pj):
+        """Per-pair (radial, angular) cutoffs for a device pair list: the
+        floats for uniform cutoffs, gathered (P,) tensors per species."""
+        if self._rc_r_tab is None:
+            return self._rc_r, self._rc_a
+        return (ops.pair_cutoff(self._rc_r_tab, atom_types, pi, pj),
+                ops.pair_cutoff(self._rc_a_tab, atom_types, pi, pj))
+
+    def _split_pairs(self, atom_types, pi, pj, rij, d):
+        """Radial / angular pair lists from a search within max(rc), each
+        pair filtered by its own cutoff."""
+        rc_r, rc_a = self._pair_rc(atom_types, pi, pj)
+        m_r = d < rc_r
+        m_a = d < rc_a
+        return (pi[m_r], pj[m_r], rij[m_r]), (pi[m_a], pj[m_a], rij[m_a])
+
+    def _search_device(self, pos, cell_b, nat, off):
+        """Batched brute-force neighbor search on the device (the numpy
+        builder's algorithm, vectorised over frames).
+
+        ``pos`` (Ntot, 3) wrapped positions of the batch, ``cell_b`` (B, 3, 3),
+        ``nat`` / ``off`` per-frame atom counts / offsets (host ints).
+        Frames are grouped by size (padding waste bounded by a memory
+        budget); the pair order returned is frame-major, then (i, j, image)
+        — identical to the cached path's order. Returns
+        ``(pair_i, pair_j, rij, d)`` for all pairs within ``max(rc)``.
+        """
+        dev = pos.device
+        rc = max(self._rc_r, self._rc_a)
+        B = len(nat)
+        inv = torch.linalg.inv(cell_b)                                # (B, 3, 3)
+        # image repeats per frame and direction (as image_repeats(): the
+        # perpendicular plane distance is 1/|inv[:, i]|)
+        nrep = torch.ceil(rc * torch.linalg.norm(inv, dim=1)).to(torch.long)   # (B, 3)
+        nrep_h = nrep.cpu().numpy()
+        nat_a = np.asarray(nat); off_a = np.asarray(off)
+        order = np.argsort(nat_a, kind="stable")
+        budget = 16_000_000 if dev.type != "cpu" else 2_000_000
+        pis, pjs, rijs, fids = [], [], [], []
+        k = 0
+        while k < B:
+            # group of consecutive (size-sorted) frames within the budget
+            g = [order[k]]; k += 1
+            while k < B:
+                cand = g + [order[k]]
+                nmax = int(nat_a[cand].max())
+                srep = (2 * nrep_h[cand].max(axis=0) + 1).prod()
+                if len(cand) * nmax * nmax * srep > budget:
+                    break
+                g = cand; k += 1
+            g = np.asarray(g)
+            G = len(g); nmax = int(nat_a[g].max())
+            rmax = nrep_h[g].max(axis=0)
+            ranges = [torch.arange(-int(r), int(r) + 1, device=dev) for r in rmax]
+            shifts_int = torch.stack(torch.meshgrid(*ranges, indexing="ij"),
+                                     dim=-1).reshape(-1, 3)             # (S, 3)
+            S = shifts_int.shape[0]
+            zero_shift = (shifts_int == 0).all(dim=1)
+            g_t = torch.as_tensor(g, device=dev)
+            cells = cell_b[g_t]                                          # (G, 3, 3)
+            sc = torch.matmul(shifts_int.to(self.dtype), cells)          # (G, S, 3)
+            # padded positions (G, nmax, 3)
+            ar = torch.arange(nmax, device=dev)
+            nat_g = torch.as_tensor(nat_a[g], device=dev)
+            off_g = torch.as_tensor(off_a[g], device=dev)
+            amask = ar.unsqueeze(0) < nat_g.unsqueeze(1)                 # (G, nmax)
+            gidx = (off_g.unsqueeze(1) + ar.unsqueeze(0)).clamp_(max=pos.shape[0] - 1)
+            gidx = torch.where(amask, gidx, torch.zeros_like(gidx))
+            pp = pos[gidx]                                               # (G, nmax, 3)
+            disp = (pp[:, None, :, None, :] + sc[:, None, None, :, :]
+                    - pp[:, :, None, None, :])                           # (G, N, N, S, 3)
+            dist = torch.linalg.norm(disp, dim=-1)
+            valid = (dist < rc) & (dist > 1e-10)
+            valid &= amask[:, :, None, None] & amask[:, None, :, None]
+            self_pair = torch.eye(nmax, dtype=torch.bool, device=dev)[None, :, :, None] \
+                & zero_shift[None, None, None, :]
+            valid &= ~self_pair
+            nz = valid.nonzero()                                         # (P, 4): g, i, j, s
+            if nz.shape[0] == 0:
+                continue
+            gg, ii, jj, ss = nz.unbind(1)
+            pis.append(off_g[gg] + ii); pjs.append(off_g[gg] + jj)
+            rijs.append(disp[gg, ii, jj, ss]); fids.append(g_t[gg])
+        if not pis:
+            z = torch.zeros(0, dtype=torch.long, device=dev)
+            return z, z.clone(), torch.zeros(0, 3, dtype=self.dtype, device=dev), \
+                torch.zeros(0, dtype=self.dtype, device=dev)
+        pi = torch.cat(pis); pj = torch.cat(pjs); rij = torch.cat(rijs)
+        fid = torch.cat(fids)
+        # restore batch frame order (pairs were produced size-sorted)
+        _, perm = torch.sort(fid, stable=True)
+        pi, pj, rij = pi[perm], pj[perm], rij[perm]
+        return pi, pj, rij, torch.linalg.norm(rij, dim=-1)
+
+    def scan_max_neighbors(self, batch_size: int = 256):
+        """``on_the_fly`` only: run the device search over the whole shard
+        once and return (max_NN_radial, max_NN_angular) — nep.txt needs
+        them for GPUMD's buffer sizing. Cached for repeated calls."""
+        if self.neighbor_mode != "on_the_fly":
+            raise RuntimeError("scan_max_neighbors is for on_the_fly stores")
+        if self._max_nn is not None:
+            return self._max_nn
+        max_r = max_a = 0
+        for st in range(0, self.n, batch_size):
+            idx = list(range(st, min(self.n, st + batch_size)))
+            staged = self._assemble_cpu(idx)
+            if "dev_pairs" in staged:           # searched on the side stream
+                torch.cuda.current_stream(self.device).wait_event(staged["dev_event"])
+                dp = staged["dev_pairs"]
+                pi_r, pi_a = dp["pair_i_rad"], dp["pair_i_ang"]
+            else:
+                pos = self._to_dev(staged["positions"])
+                cell_b = self._to_dev(staged["cells"])
+                at = self._to_dev(staged["atom_types"])
+                pi, pj, rij, d = self._search_device(pos, cell_b, staged["nat"],
+                                                     staged["off"])
+                (pi_r, _, _), (pi_a, _, _) = self._split_pairs(at, pi, pj, rij, d)
+            if pi_r.numel() == 0:
+                continue
+            n_atoms = staged["N"]
+            cr = torch.bincount(pi_r, minlength=n_atoms)
+            ca = torch.bincount(pi_a, minlength=n_atoms)
+            max_r = max(max_r, int(cr.max()))
+            max_a = max(max_a, int(ca.max()))
+        self._max_nn = (max_r, max_a)
+        return self._max_nn
+
+    def _assemble_cpu(self, indices: List[int]) -> Dict:
+        """CPU half of collate: gather the frames' arrays into contiguous
+        (pinned) host tensors. Runs entirely on the CPU, so a background
+        thread can execute it while the device chews the previous batch
+        (see ``iter_collated``)."""
+        idx = np.asarray(indices, dtype=np.int64)
+        nat = self._nat[idx]
+        offsets = np.concatenate([[0], np.cumsum(nat)])
+
+        idx_t = torch.from_numpy(idx)
+        nat_t = torch.from_numpy(nat)
+        off_t = torch.from_numpy(offsets[:-1])
+
+        pin = self._pin
+        def _stage(t):
+            return t.pin_memory() if pin else t
+
+        out = {
+            "N": int(offsets[-1]), "num_structures": len(indices),
+            "idx_t": idx_t,
+            "atom_types": _stage(self._cat(self._at_all, idx, self._nat_cum)),
+            "struct_idx": _stage(torch.repeat_interleave(
+                torch.arange(len(indices), dtype=torch.long), nat_t)),
         }
+        mode = self.neighbor_mode
+        if mode == "cached":
+            nr = self._nrad[idx]; na = self._nang[idx]
+            nr_t = torch.from_numpy(nr); na_t = torch.from_numpy(na)
+            # Pair indices are frame-local in storage; shift each frame's
+            # pairs by its atom offset within the batch.
+            off_rep_r = torch.repeat_interleave(off_t, nr_t)
+            off_rep_a = torch.repeat_interleave(off_t, na_t)
+            out.update({
+                "pair_i_rad": _stage(
+                    self._cat(self._pi_r_all, idx, self._nrad_cum).to(torch.long) + off_rep_r),
+                "pair_j_rad": _stage(
+                    self._cat(self._pj_r_all, idx, self._nrad_cum).to(torch.long) + off_rep_r),
+                "rij_rad": _stage(self._cat(self._rij_r_all, idx, self._nrad_cum)),
+                "pair_i_ang": _stage(
+                    self._cat(self._pi_a_all, idx, self._nang_cum).to(torch.long) + off_rep_a),
+                "pair_j_ang": _stage(
+                    self._cat(self._pj_a_all, idx, self._nang_cum).to(torch.long) + off_rep_a),
+                "rij_ang": _stage(self._cat(self._rij_a_all, idx, self._nang_cum)),
+            })
+        else:
+            out["positions"] = _stage(self._cat(self._pos_all, idx, self._nat_cum))
+            out["cells"] = _stage(self._cell_all[idx_t])
+            if mode == "compact":
+                nr = self._nrad[idx]; na = self._nang[idx]
+                nr_t = torch.from_numpy(nr); na_t = torch.from_numpy(na)
+                off_rep_r = torch.repeat_interleave(off_t, nr_t)
+                off_rep_a = torch.repeat_interleave(off_t, na_t)
+                cum = self._nrad_cum
+                # angular pairs = the first n_ang pairs of each frame's
+                # radial list -> one index tensor selects them out of the
+                # batch's radial arrays on the device (no second rij pass)
+                rad_off = np.concatenate([[0], np.cumsum(nr)])[:-1]
+                ang_in_rad = torch.from_numpy(np.concatenate(
+                    [np.arange(o, o + k) for o, k in zip(rad_off, na)]
+                    or [np.zeros(0, np.int64)]))
+                out.update({
+                    "pair_i_rad": _stage(
+                        self._cat(self._pi_all, idx, cum).to(torch.long) + off_rep_r),
+                    "pair_j_rad": _stage(
+                        self._cat(self._pj_all, idx, cum).to(torch.long) + off_rep_r),
+                    "shift_rad": _stage(self._cat(self._sh_all, idx, cum)),
+                    "ang_in_rad": _stage(ang_in_rad),
+                })
+            else:
+                out["nat"] = nat; out["off"] = offsets[:-1]
+                if self._side_stream is not None:
+                    with torch.cuda.stream(self._side_stream):
+                        pos = out["positions"].to(self.device, non_blocking=True)
+                        cells = out["cells"].to(self.device, non_blocking=True)
+                        at = out["atom_types"].to(self.device, non_blocking=True)
+                        pi, pj, rij, d = self._search_device(pos, cells, nat,
+                                                             offsets[:-1])
+                        (pi_r, pj_r, rij_r), (pi_a, pj_a, rij_a) = \
+                            self._split_pairs(at, pi, pj, rij, d)
+                        dev_pairs = {"positions": pos, "cells": cells,
+                                     "pair_i_rad": pi_r, "pair_j_rad": pj_r,
+                                     "rij_rad": rij_r,
+                                     "pair_i_ang": pi_a, "pair_j_ang": pj_a,
+                                     "rij_ang": rij_a}
+                        ev = torch.cuda.Event()
+                        ev.record(self._side_stream)
+                    out["dev_pairs"] = dev_pairs
+                    out["dev_event"] = ev
+        out.update({
+            "energy": _stage(self._energy_t[idx_t]),
+            "natoms": _stage(self._nat_t[idx_t].to(self.dtype)),
+            "energy_mask": _stage(self._e_flag_t[idx_t]),
+            "forces": _stage(self._cat(self._f_all, idx, self._nat_cum)),
+            "force_mask": _stage(torch.repeat_interleave(
+                self._f_flag_t[idx_t], nat_t)),
+            "virial": _stage(self._v_all[idx_t].to(self.dtype)),
+            "virial_mask": _stage(self._v_flag_t[idx_t]),
+            "volumes": _stage(self._vol_cpu[idx_t]),
+            # CPU-side mask summaries: the training loop branches on
+            # "does this batch have any energy/force/virial labels" — as
+            # host bools they cost nothing, while `mask.any()` on the
+            # device tensor would drain the compute stream every step.
+            "has_e": bool(self._e_flag_t[idx_t].any()),
+            "has_f": bool(self._f_flag_t[idx_t].any()),
+            "has_v": bool(self._v_flag_t[idx_t].any()),
+        })
+        return out
 
-        batch["energy_mask"] = torch.tensor(
-            [self.has_energy_flag[i] for i in indices],
-            dtype=torch.bool, device=self.device)
+    _COMMON_KEYS = ("atom_types", "struct_idx", "energy", "natoms",
+                    "energy_mask", "forces", "force_mask", "virial",
+                    "virial_mask", "volumes")
+    _MODE_KEYS = {
+        "cached": ("pair_i_rad", "pair_j_rad", "rij_rad",
+                   "pair_i_ang", "pair_j_ang", "rij_ang"),
+        "compact": ("positions", "cells", "pair_i_rad", "pair_j_rad",
+                    "shift_rad", "ang_in_rad"),
+        "on_the_fly": ("positions", "cells"),
+    }
 
-        batch["forces"] = torch.cat([self.forces[i] for i in indices])
-        force_flags = [self.has_forces_flag[i] for i in indices]
-        batch["force_mask"] = torch.cat([
-            torch.full((self.natoms[indices[k]],), force_flags[k],
-                       dtype=torch.bool, device=self.device)
-            for k in range(B)
-        ])
+    def _basis_impl(self, rij_r, rij_a, rc_r, rc_a):
+        """Per-batch Chebyshev/angular basis.
 
-        batch["virial"] = torch.stack([self.virial[i] for i in indices])
-        batch["virial_mask"] = torch.tensor(
-            [self.has_virial_flag[i] for i in indices],
-            dtype=torch.bool, device=self.device)
+        ``rc_r`` / ``rc_a``: the cutoff floats, or per-pair (P,) tensors for
+        per-species cutoffs (see ``_pair_rc``). Per-pair elementwise math —
+        chunking-invariant, so results do not depend on how the dataset is
+        batched. ``compile_basis`` may swap in a torch.compile'd version of
+        this same method.
+        """
+        dr = torch.norm(rij_r, dim=-1)
+        fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_r, self._bs_r)
+        da = torch.norm(rij_a, dim=-1)
+        fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, rc_a, self._bs_a)
+        dinv_a = 1.0 / da
+        if self._num_lm > 0:
+            blm = ops.angular_basis(
+                rij_a[:, 0] * dinv_a, rij_a[:, 1] * dinv_a,
+                rij_a[:, 2] * dinv_a, self._l3)
+        else:
+            blm = torch.zeros(rij_a.shape[0], 0, dtype=self.dtype,
+                              device=self.device)
+        return fk_r, fkp_r, 1.0 / dr, fk_a, fkp_a, dinv_a, blm
 
-        if self.has_cached_basis:
-            batch["fk_rad"] = torch.cat([self.fk_rad[i] for i in indices])
-            batch["fkp_rad"] = torch.cat([self.fkp_rad[i] for i in indices])
-            batch["d12inv_rad"] = torch.cat([self.d12inv_rad[i] for i in indices])
-            batch["fk_ang"] = torch.cat([self.fk_ang[i] for i in indices])
-            batch["fkp_ang"] = torch.cat([self.fkp_ang[i] for i in indices])
-            batch["d12inv_ang"] = torch.cat([self.d12inv_ang[i] for i in indices])
-            batch["blm"] = torch.cat([self.blm[i] for i in indices])
+    def compile_basis(self):
+        """torch.compile the per-batch basis compute (~4x fewer kernel
+        launches per batch). Only used when the training compute itself is
+        compiled: Inductor's fusion reassociates float ops, so the compiled
+        basis deviates from the eager one at the same ~1e-7 level the
+        compiled training compute already introduces. Never enabled in
+        eager runs, which keeps eager training exactly chunking-invariant.
+        """
+        self._basis_fn = torch.compile(self._basis_impl, dynamic=True)
+
+    def _finalize(self, staged: Dict) -> Dict:
+        """Device half of collate: ship the staged host tensors to the
+        device (async — they are pinned) and compute the batch's basis."""
+        dev = self.device
+        batch = {"N": staged["N"], "num_structures": staged["num_structures"],
+                 "has_e": staged["has_e"], "has_f": staged["has_f"],
+                 "has_v": staged["has_v"]}
+        mode = self.neighbor_mode
+        keys = self._COMMON_KEYS + self._MODE_KEYS[mode]
+        if "dev_pairs" in staged:               # on_the_fly, searched on the side stream
+            keys = self._COMMON_KEYS
+        for key in keys:
+            t = staged[key]
+            batch[key] = (t.to(dev, non_blocking=True) if self._pin
+                          else t.to(dev))
+        if "dev_pairs" in staged:
+            cur = torch.cuda.current_stream(dev)
+            cur.wait_event(staged["dev_event"])
+            for k, t in staged["dev_pairs"].items():
+                t.record_stream(cur)            # allocated on the side stream
+                batch[k] = t
+        elif mode == "compact":
+            # displacement vectors from wrapped positions + image shifts
+            pos, cells, sidx = batch["positions"], batch["cells"], batch["struct_idx"]
+            batch["rij_rad"] = self._rij_from_shifts(
+                pos, batch["pair_i_rad"], batch["pair_j_rad"],
+                batch.pop("shift_rad"), cells, sidx)
+            sel = batch.pop("ang_in_rad")
+            batch["pair_i_ang"] = batch["pair_i_rad"][sel]
+            batch["pair_j_ang"] = batch["pair_j_rad"][sel]
+            batch["rij_ang"] = batch["rij_rad"][sel]
+        elif mode == "on_the_fly":              # CPU / MPS: search in place
+            pi, pj, rij, d = self._search_device(
+                batch["positions"], batch["cells"], staged["nat"], staged["off"])
+            (batch["pair_i_rad"], batch["pair_j_rad"], batch["rij_rad"]), \
+                (batch["pair_i_ang"], batch["pair_j_ang"], batch["rij_ang"]) = \
+                self._split_pairs(batch["atom_types"], pi, pj, rij, d)
+        at = batch["atom_types"]
+        rc_r, _ = self._pair_rc(at, batch["pair_i_rad"], batch["pair_j_rad"])
+        _, rc_a = self._pair_rc(at, batch["pair_i_ang"], batch["pair_j_ang"])
+        (batch["fk_rad"], batch["fkp_rad"], batch["d12inv_rad"],
+         batch["fk_ang"], batch["fkp_ang"], batch["d12inv_ang"],
+         batch["blm"]) = self._basis_fn(batch["rij_rad"], batch["rij_ang"],
+                                        rc_r, rc_a)
 
         return batch
+
+    def collate(self, indices: List[int]) -> Dict:
+        """Assemble one batch on the CPU, ship it to the device, and compute
+        the batch's basis there. Returns the collated batch dict."""
+        return self._finalize(self._assemble_cpu(indices))
+
+
+_PROF = int(os.environ.get("TORCHNEP_PROFILE", "0") or "0")
+_SENTINEL = object()
+
+
+def _timed_iter(gen, sink, sync_cuda):
+    """Wrap a batch iterator, splitting wall time between "waiting for /
+    finalizing data" (sink[0]) and "the consumer's loop body" (sink[1]).
+
+    With ``sync_cuda`` (TORCHNEP_PROFILE=2) a device synchronize runs at
+    both boundaries, converting the CPU walls into true GPU-inclusive
+    phase times (at the cost of disabling pipeline overlap — profiling
+    mode only).
+    """
+    gen = iter(gen)
+    while True:
+        t0 = time.perf_counter()
+        item = next(gen, _SENTINEL)
+        if sync_cuda:
+            torch.cuda.synchronize()
+        sink[0] += time.perf_counter() - t0
+        if item is _SENTINEL:
+            return
+        t0 = time.perf_counter()
+        yield item
+        if sync_cuda:
+            torch.cuda.synchronize()
+        sink[1] += time.perf_counter() - t0
+
+
+def iter_collated(data_store, index_lists):
+    """Yield collated device batches for ``index_lists``, in order.
+
+    For a ``StreamDataStore`` the CPU half of each collate (gather + pinning)
+    runs in a background thread one batch ahead, overlapping with the
+    device compute of the current batch; only the cheap device half
+    (async H2D + basis kernels) stays on the caller's thread. Batches are
+    identical to calling ``store.collate`` directly — this only changes
+    WHEN the CPU work happens, never what it produces.
+
+    For any other store this is a plain sequential collate loop.
+    """
+    if not isinstance(data_store, StreamDataStore) or len(index_lists) <= 1:
+        for idx in index_lists:
+            yield data_store.collate(idx)
+        return
+
+    import queue
+    import threading
+
+    q = queue.Queue(maxsize=2)
+    stop = threading.Event()
+
+    def _worker():
+        try:
+            for idx in index_lists:
+                if stop.is_set():
+                    return
+                q.put(("ok", data_store._assemble_cpu(idx)))
+        except BaseException as e:          # surface in the consumer
+            q.put(("err", e))
+            return
+        q.put(("done", None))
+
+    t = threading.Thread(target=_worker, daemon=True,
+                         name="torchnep-stream-prefetch")
+    t.start()
+    try:
+        while True:
+            tag, payload = q.get()
+            if tag == "done":
+                break
+            if tag == "err":
+                raise payload
+            yield data_store._finalize(payload)
+    finally:
+        stop.set()
+        # Unblock the worker if it is waiting on a full queue.
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+        t.join(timeout=5.0)
 
 
 # ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------
 
+NEIGHBOR_MODES = ("cached", "compact", "on_the_fly")
+
+
 def _preprocess_one_frame(args):
-    """Worker: build neighbor lists for a single frame. Picklable for mp.Pool."""
-    frame, rc_rad, rc_ang, max_rc, type_names, dtype = args
+    """Worker: build neighbor lists for a single frame. Picklable for mp.Pool.
+
+    ``mode`` selects what the structure carries (see ``StreamDataStore``):
+
+    - ``cached``: full radial + angular pair lists with displacement vectors
+      (the original layout, 28 bytes per pair per list);
+    - ``compact``: one pair list (angular pairs first, ``n_ang`` of them)
+      as int32 indices + int8 image shifts (11 bytes per pair) plus the
+      wrapped positions and cell — ``rij`` is recomputed on the device;
+    - ``on_the_fly``: wrapped positions and cell only; the neighbor search
+      itself runs on the device per batch.
+    """
+    frame, rc_rad, rc_ang, max_rc, type_names, dtype, mode = args
+    # rc_rad / rc_ang: floats, or (T, T) per-element-pair tables
     positions = frame["positions"].astype(dtype)
     cell = frame["cell"].astype(dtype)
     atom_types = np.array([type_names.index(s) for s in frame["species"]],
                           dtype=np.int64)
-    pair_i, pair_j, rij = build_neighbor_list_np(positions, cell, max_rc)
-    dij = np.linalg.norm(rij, axis=1)
-    rad_mask = dij < rc_rad
-    ang_mask = dij < rc_ang
     s = {
         "natoms": frame["natoms"],
         "atom_types": atom_types,
         "volume": float(abs(np.linalg.det(cell))),   # A**3, used for stress RMSE
-        "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
-        "rij_rad": rij[rad_mask].astype(dtype),
-        "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
-        "rij_ang": rij[ang_mask].astype(dtype),
     }
+    if mode == "on_the_fly":
+        s["positions"], _ = wrap_positions(positions, cell)
+        s["positions"] = s["positions"].astype(dtype, copy=False)
+        s["cell"] = cell
+    else:
+        pair_i, pair_j, rij, shift, pos_w = build_neighbor_list_np_ex(
+            positions, cell, max_rc)
+        dij = np.linalg.norm(rij, axis=1)
+        rad_mask = dij < pair_cutoff_np(rc_rad, atom_types, pair_i, pair_j)
+        ang_mask = dij < pair_cutoff_np(rc_ang, atom_types, pair_i, pair_j)
+        if mode == "cached":
+            s.update({
+                "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
+                "rij_rad": rij[rad_mask].astype(dtype),
+                "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
+                "rij_ang": rij[ang_mask].astype(dtype),
+            })
+        else:   # compact: radial list with the angular pairs first
+            # rc_ang <= rc_rad in NEP, so ang pairs are a subset of the
+            # radial pairs; a stable partition keeps the builder's order
+            # inside each group.
+            order = np.concatenate([np.nonzero(rad_mask & ang_mask)[0],
+                                    np.nonzero(rad_mask & ~ang_mask)[0]])
+            n_ang = int((rad_mask & ang_mask).sum())
+            s.update({
+                "pair_i_rad": pair_i[order].astype(np.int32),
+                "pair_j_rad": pair_j[order].astype(np.int32),
+                "shift_rad": shift[order].astype(np.int8),
+                "n_ang": n_ang,
+                "positions": pos_w.astype(dtype, copy=False),
+                "cell": cell,
+            })
+            s["pair_i_ang"] = s["pair_i_rad"][:n_ang]      # views, no copy
     if "energy" in frame:
         s["energy"] = frame["energy"]
     if "forces" in frame:
@@ -526,8 +960,45 @@ def _preprocess_one_frame(args):
     return s
 
 
-def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
+def _preproc_workers(n_workers=None):
+    """Worker count for neighbor-list pools (see preprocess_structures)."""
+    if n_workers is not None:
+        return n_workers
+    # sched_getaffinity respects cgroup/slurm CPU limits;
+    # os.cpu_count() reports the whole node and oversubscribes the
+    # allocation (e.g. 80 workers fighting over a 24-core cgroup).
+    try:
+        cpu_total = len(os.sched_getaffinity(0))
+    except AttributeError:          # non-Linux
+        cpu_total = os.cpu_count() or 1
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    n_workers = max(1, cpu_total // local_world)
+    return int(os.environ.get("TORCHNEP_PREPROC_WORKERS", n_workers))
+
+
+def make_preproc_pool(n_workers=None):
+    """A reusable neighbor-list worker pool (fork by default, see
+    preprocess_structures), or None when pooling is disabled. Callers that
+    preprocess many small chunks (streamed prediction) create it once instead
+    of paying the pool start-up per chunk."""
+    n_workers = _preproc_workers(n_workers)
+    if n_workers <= 1:
+        return None
+    import multiprocessing as mp
+    method = os.environ.get("TORCHNEP_MP_START_METHOD", "fork")
+    try:
+        ctx = mp.get_context(method)
+    except ValueError:
+        ctx = mp.get_context("spawn")
+    return ctx.Pool(n_workers)
+
+
+def preprocess_structures(frames, config, dtype=np.float32, n_workers=None,
+                          pool=None, mode="cached"):
     """Build neighbor lists for all frames, parallelized across CPU cores.
+
+    ``mode`` (``cached`` / ``compact`` / ``on_the_fly``) selects the
+    per-structure layout, see :func:`_preprocess_one_frame`.
 
     Per-frame work is embarrassingly parallel. Worker behavior:
 
@@ -543,40 +1014,196 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
       behaves pathologically (rare).
 
     Disable pooling entirely with ``n_workers=1`` (useful for debugging).
+    ``pool``: an existing pool from :func:`make_preproc_pool` to reuse (the
+    caller owns it); otherwise a pool is created and closed per call.
     """
     rc_rad = config["cutoff_radial"]
     rc_ang = config["cutoff_angular"]
     type_names = config["type_names"]
     max_rc = max(rc_rad, rc_ang)
+    if config.get("cutoff_radial_per_type") is not None:
+        # per-species cutoffs: search within the largest, then filter each
+        # pair by its own (T, T) table value
+        rc_rad = cutoff_pair_table(config["cutoff_radial_per_type"])
+        rc_ang = cutoff_pair_table(config["cutoff_angular_per_type"])
+    if mode not in NEIGHBOR_MODES:
+        raise ValueError(f"neighbor mode {mode!r} not in {NEIGHBOR_MODES}")
+    args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype, mode)
+            for f in frames]
 
-    if n_workers is None:
-        cpu_total = os.cpu_count() or 1
-        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
-        n_workers = max(1, cpu_total // local_world)
-        n_workers = int(os.environ.get("TORCHNEP_PREPROC_WORKERS", n_workers))
+    if pool is not None:
+        if len(frames) < 64:
+            return [_preprocess_one_frame(a) for a in args]
+        n_workers = getattr(pool, "_processes", 1) or 1
+        return pool.map(_preprocess_one_frame, args,
+                        chunksize=max(1, len(frames) // (n_workers * 4)))
 
+    n_workers = _preproc_workers(n_workers)
     if n_workers <= 1 or len(frames) < 64:
-        return [_preprocess_one_frame((f, rc_rad, rc_ang, max_rc, type_names, dtype))
-                for f in frames]
+        return [_preprocess_one_frame(a) for a in args]
 
     import multiprocessing as mp
+    import gc
     method = os.environ.get("TORCHNEP_MP_START_METHOD", "fork")
     try:
         ctx = mp.get_context(method)
     except ValueError:
         ctx = mp.get_context("spawn")
-
-    args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype) for f in frames]
     chunksize = max(1, len(frames) // (n_workers * 4))
-    with ctx.Pool(n_workers) as pool:
-        return pool.map(_preprocess_one_frame, args, chunksize=chunksize)
+    # Forked workers share the parent's pages copy-on-write; a garbage
+    # collection in a worker would touch every parent object's refcount and
+    # copy the whole parsed-frames heap into each worker. Freezing the
+    # parent's objects before the fork keeps them out of the workers' GC.
+    gc.freeze()
+    try:
+        with ctx.Pool(n_workers) as pool:
+            return pool.map(_preprocess_one_frame, args, chunksize=chunksize)
+    finally:
+        gc.unfreeze()
+
+
+def estimate_store_bytes(frames, config, itemsize=4, sample=512):
+    """Host-memory need of the three ``StreamDataStore`` layouts for
+    ``frames`` (parsed frame dicts), in bytes, as ``{"cached": b,
+    "compact": b, "on_the_fly": b}``.
+
+    The pair counts are MEASURED on an evenly spaced sample of up to
+    ``sample`` frames with the numpy builder and scaled by the atom count
+    (a density formula over-estimates real data sets several-fold). Each figure
+    is the peak while the store is built: the per-frame arrays plus the
+    store's concatenated copy grow/shrink together (~1.2x the data), with
+    the parsed frames (float64 positions / forces + dict overhead) alive
+    during preprocessing on top.
+    """
+    rc_r = float(config["cutoff_radial"]); rc_a = float(config["cutoff_angular"])
+    max_rc = max(rc_r, rc_a)
+    n = len(frames)
+    nat = np.asarray([f["natoms"] for f in frames], dtype=np.float64)
+    atoms = float(nat.sum())
+    idx = np.unique(np.linspace(0, n - 1, min(sample, n)).astype(np.int64)) if n else []
+    pr = pa = 0; atoms_s = 0.0
+    for i in idx:
+        f = frames[i]
+        _, _, rij = build_neighbor_list_np(np.asarray(f["positions"], dtype=np.float64),
+                                           np.asarray(f["cell"], dtype=np.float64), max_rc)
+        d = np.linalg.norm(rij, axis=1)
+        pr += int((d < rc_r).sum()); pa += int((d < rc_a).sum()); atoms_s += f["natoms"]
+    scale = atoms / max(atoms_s, 1.0)
+    pairs_r, pairs_a = pr * scale, pa * scale
+    per_pair = 4 + 4 + 3 * itemsize                      # int32 i, j + rij
+    cached = (pairs_r + pairs_a) * per_pair
+    compact = pairs_r * (4 + 4 + 3) + atoms * 3 * itemsize + n * 9 * itemsize
+    geometry = atoms * 3 * itemsize + n * 9 * itemsize
+    labels = atoms * (3 * itemsize + 8) + n * 300         # forces, types, per-frame scalars
+    parsed = atoms * 48 + n * 1500                        # frame dicts alive while preprocessing
+    # Calibrated against measured multi-node runs: per-rank RSS =
+    # ~1.5 x the store data + a fixed ~4.5 GiB (torch + HIP/CUDA runtime,
+    # BLAS libraries, RCCL, pinned staging) + the end-of-training
+    # prediction, whose global arrays on rank 0 cost ~1 KB per frame.
+    runtime = 4.5 * 2 ** 30
+    predict = n * 1024.0
+    return {"cached": 1.5 * cached + labels + parsed + runtime + predict,
+            "compact": 1.5 * compact + labels + parsed + runtime + predict,
+            "on_the_fly": 1.5 * geometry + labels + parsed + runtime + predict}
+
+
+def host_memory_budget():
+    """Host bytes this process may use: min(cgroup limit, physical RAM)
+    divided by the number of ranks sharing the node (LOCAL_WORLD_SIZE /
+    SLURM_NTASKS_PER_NODE). None when it cannot be determined."""
+    limits = []
+    for p in ("/sys/fs/cgroup/memory.max",
+              "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = open(p).read().strip()
+            if v.isdigit() and int(v) < 1 << 60:
+                limits.append(int(v))
+        except OSError:
+            pass
+    try:
+        limits.append(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        pass
+    if not limits:
+        return None
+    local = int(os.environ.get("LOCAL_WORLD_SIZE",
+                               os.environ.get("SLURM_NTASKS_PER_NODE", 1)))
+    return min(limits) / max(1, local)
+
+
+def choose_neighbor_mode(frames, config, requested="auto", itemsize=4,
+                         fraction=0.75, log=print):
+    """Resolve ``requested`` (``auto`` or an explicit mode) to a mode.
+
+    ``auto`` takes the first layout, in the order cached -> compact ->
+    on_the_fly, whose estimated host need fits in ``fraction`` of this
+    rank's memory budget (0.75: the estimate is calibrated to within ~15%
+    of the measured peak, see :func:`estimate_store_bytes`). Returns
+    ``(mode, estimate_dict, budget)``."""
+    est = estimate_store_bytes(frames, config, itemsize)
+    budget = host_memory_budget()
+    if requested != "auto":
+        if requested not in NEIGHBOR_MODES:
+            raise ValueError(f"neighbor_mode {requested!r} not in "
+                             f"('auto',) + {NEIGHBOR_MODES}")
+        return requested, est, budget
+    if budget is None:
+        return "cached", est, budget
+    for m in NEIGHBOR_MODES:
+        if est[m] <= fraction * budget:
+            return m, est, budget
+    return "on_the_fly", est, budget
+
+
+def _fmt_gb(b):
+    return f"{b / 2**30:.1f} GiB"
+
+
+def host_rss():
+    """(current, peak) resident set size of this process in bytes (Linux
+    /proc; peak from getrusage elsewhere). Zeros when unavailable."""
+    cur = peak = 0
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmRSS:"):
+                cur = int(line.split()[1]) * 1024
+            elif line.startswith("VmHWM:"):
+                peak = int(line.split()[1]) * 1024
+    except OSError:
+        try:
+            import resource
+            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            peak = r * (1 if platform.system() == "Darwin" else 1024)
+            cur = peak
+        except Exception:
+            pass
+    return cur, peak
+
+
+def host_mem_line(tag, dist_mod=None, device=None):
+    """Log line with this process's host RSS (now / peak); with a torch
+    distributed process group the min / max over ranks are folded in."""
+    cur, peak = host_rss()
+    s = f"  host memory [{tag}]: RSS {_fmt_gb(cur)} (peak {_fmt_gb(peak)})"
+    if dist_mod is not None and dist_mod.is_initialized():
+        t = torch.tensor([cur, -cur, peak], dtype=torch.float64,
+                         device=device if device is not None else "cpu")
+        dist_mod.all_reduce(t, op=dist_mod.ReduceOp.MAX)
+        s += (f"; over ranks RSS min {_fmt_gb(-t[1].item())} max "
+              f"{_fmt_gb(t[0].item())}, peak max {_fmt_gb(t[2].item())}")
+    return s
 
 
 def compute_max_neighbors(structures):
-    """Return (max_NN_radial, max_NN_angular) over all structures."""
+    """Return (max_NN_radial, max_NN_angular) over all structures.
+
+    Structures without pair lists (``on_the_fly`` mode) contribute 0; the
+    store's :meth:`StreamDataStore.scan_max_neighbors` covers them."""
     max_rad = max_ang = 0
     for s in structures:
         n = s["natoms"]
+        if "pair_i_rad" not in s:
+            continue
         if len(s["pair_i_rad"]) > 0:
             counts = np.bincount(s["pair_i_rad"], minlength=n)
             max_rad = max(max_rad, int(counts.max()))
@@ -700,6 +1327,60 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
 # LR scheduler helpers
 # ---------------------------------------------------------------------------
 
+def _default_alloc_conf():
+    """Default the CUDA caching allocator to expandable_segments.
+
+    Batches have a different shape every step, so the block-pool
+    allocator fragments badly — measured on unep16: reserved memory 26
+    GiB for 5.7 GiB actually allocated at batch 512; expandable segments
+    collapse that to ~6.3 GiB at identical speed. Applied only when the
+    user has not set PYTORCH_ALLOC_CONF / PYTORCH_CUDA_ALLOC_CONF
+    themselves, on CUDA (not ROCm), and only before the CUDA context
+    exists (the allocator reads the env once at first use).
+    """
+    if ("PYTORCH_ALLOC_CONF" in os.environ
+            or "PYTORCH_CUDA_ALLOC_CONF" in os.environ):
+        return
+    if torch.version.hip is not None or not torch.cuda.is_available():
+        return
+    if torch.cuda.is_initialized():
+        return
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+
+def _make_optimizer(named_params, lr, weight_decay):
+    """Adam (weight_decay=0) or AdamW (>0), fused on CUDA when available.
+
+    weight_decay > 0 switches to AdamW (decoupled decay, the MACE-style
+    regularizer): plain-Adam L2-in-the-gradient gets rescaled by the
+    second-moment normalization, so decay strength would vary per
+    parameter — AdamW applies it directly to the weights. With
+    weight_decay = 0 both optimizers are identical.
+
+    ALL trainable parameters decay, including the b0 biases (b1 is not
+    in the optimizer — it is solved analytically). A bias-exempt group
+    was tried and rejected: it fit the training set identically but lost
+    ~30-40% on validation/independent-test energies (unep16, 2 seeds) —
+    for this architecture the thresholds b0 need the same shrinkage
+    pressure as the weights, matching GPUMD's all-parameter
+    regularization.
+
+    ``fused=True`` runs the whole update as one kernel per device/dtype
+    group instead of several ``foreach`` launches per state tensor — same
+    algorithm, only the arithmetic grouping differs. The try/except keeps
+    older builds or exotic device combos on the default path.
+    """
+    params = [p for _, p in named_params]
+    cls = torch.optim.AdamW if weight_decay > 0 else torch.optim.Adam
+    kwargs = dict(lr=lr, weight_decay=weight_decay, amsgrad=True)
+    if params and params[0].device.type == "cuda":
+        try:
+            return cls(params, fused=True, **kwargs)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    return cls(params, **kwargs)
+
+
 def _make_lr_scheduler(optimizer, mode, factor, patience, min_lr):
     """Build the LR scheduler — "plateau" (default) or "step".
 
@@ -737,12 +1418,20 @@ def _scheduler_step(scheduler, avg_loss, mode, optimizer, min_lr):
 
 def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
                      loss_weights=None, in_stage2=False, swa_model=None,
-                     best_true_loss=None):
+                     best_true_loss=None, run_seed=None,
+                     best_valid_loss=None, valid_info=None,
+                     start_stage2=None):
     """Write a full training checkpoint.
 
     ``scheduler`` must be the ACTIVE one (stage2_scheduler while in stage 2,
     lr_scheduler otherwise); ``in_stage2`` records which it was so the load
     side can restore the state into the right object.
+
+    ``start_stage2`` records the EFFECTIVE stage-2 start epoch — it can be
+    earlier than nep.in's value when a stage-1 early stop jumped into stage 2
+    ahead of schedule. The load side restores it only for checkpoints already
+    in stage 2, so a resumed run stays there (stage-1 checkpoints defer to
+    nep.in, keeping the documented redo-stage-2-with-edited-settings flow).
     """
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m = m.module if hasattr(m, "module") else m
@@ -752,6 +1441,8 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
         "model_state": m.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "in_stage2": in_stage2,
+        "run_seed": run_seed,
+        "start_stage2": start_stage2,
     }
     if scheduler is not None:
         state["scheduler_state"] = scheduler.state_dict()
@@ -761,6 +1452,10 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
         state["swa_state"] = swa_model.state_dict()
     if best_true_loss is not None:
         state["best_true_loss"] = best_true_loss
+    if best_valid_loss is not None:
+        state["best_valid_loss"] = best_valid_loss
+    if valid_info is not None:
+        state["valid_info"] = valid_info
     torch.save(state, path)
 
 
@@ -811,6 +1506,10 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
         "best_true_loss": ckpt.get("best_true_loss", float("inf")),
         "loss_weights": ckpt.get("loss_weights"),
         "in_stage2": in_stage2,
+        "run_seed": ckpt.get("run_seed"),
+        "best_valid_loss": ckpt.get("best_valid_loss", float("inf")),
+        "valid_info": ckpt.get("valid_info"),
+        "start_stage2": ckpt.get("start_stage2"),
     }
 
 
@@ -847,16 +1546,18 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
 
     Mirrors the training-epoch accumulation exactly (same masks, same
     per-sample units), but forward-only on one fixed set of weights.
-    Returns (sum_le, sum_lf, sum_lv, n_e, n_f, n_v, sum_e_resid) so callers
-    can finish the per-sample averaging themselves — the DDP path all-reduces
-    these numbers across ranks first, which makes the aggregated loss EXACTLY
-    the full-dataset value (a sum of per-shard sums), identical to the
-    single-GPU result. ``sum_e_resid`` (Σ signed per-atom energy residual)
-    lets the caller solve the exact optimal energy offset b1 for these frozen
-    weights in this same pass: δ = sum_e_resid / n_e, and the offset-corrected
-    energy MSE is sum_le/n_e − δ².
+    Returns (sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid) so
+    callers can finish the per-sample averaging themselves — the DDP path
+    all-reduces these numbers across ranks first, which makes the aggregated
+    loss EXACTLY the full-dataset value (a sum of per-shard sums), identical
+    to the single-GPU result. ``sum_ls`` is the stress squared-error sum in
+    (eV/Å³)² (same normalisation as the train-loop accumulator).
+    ``sum_e_resid`` (Σ signed per-atom energy residual) lets the caller solve
+    the exact optimal energy offset b1 for these frozen weights in this same
+    pass: δ = sum_e_resid / n_e, and the offset-corrected energy MSE is
+    sum_le/n_e − δ².
     """
-    sum_le = sum_lf = sum_lv = 0.0
+    sum_le = sum_lf = sum_lv = sum_ls = 0.0
     sum_e_resid = 0.0      # Σ signed per-atom energy residual (for exact b1)
     n_e = n_f = n_v = 0
 
@@ -868,10 +1569,9 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
     ctx = contextlib.nullcontext() if use_autograd_forces else torch.no_grad()
     try:
         with ctx:
-            for start in range(0, data_store.n, batch_size):
-                idx = list(range(start, min(start + batch_size,
-                                            data_store.n)))
-                batch = data_store.collate(idx)
+            eval_indices = [list(range(s, min(s + batch_size, data_store.n)))
+                            for s in range(0, data_store.n, batch_size)]
+            for batch in iter_collated(data_store, eval_indices):
                 if use_autograd_forces:
                     result = compute_props(
                         batch["rij_rad"], batch["rij_ang"],
@@ -917,12 +1617,17 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         v_ref6 = batch["virial"][:, _VIRIAL_6]
                         v_diff = (v_pred6[v_mask] - v_ref6[v_mask]) / na
                         sum_lv += (v_diff ** 2).mean(dim=1).sum().item()
+                        # Stress (eV/A**3) = virial_per_atom * natoms / V.
+                        s_scale = (batch["natoms"][v_mask]
+                                   / batch["volumes"][v_mask]).unsqueeze(-1)
+                        sum_ls += ((v_diff * s_scale) ** 2) \
+                            .mean(dim=1).sum().item()
                         n_v += int(v_mask.sum().item())
     finally:
         if was_training:
             raw_model.train()
 
-    return sum_le, sum_lf, sum_lv, n_e, n_f, n_v, sum_e_resid
+    return sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid
 
 
 def _evaluate_true_loss(data_store, batch_size, raw_model,
@@ -944,7 +1649,7 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     """
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, n_e, n_f, n_v, sum_e_resid = \
+    sum_le, sum_lf, sum_lv, _sum_ls, n_e, n_f, n_v, sum_e_resid = \
         _accumulate_true_loss_sums(
             data_store, batch_size, raw_model,
             compute_props, compute_props_cached,
@@ -961,6 +1666,37 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     mse_v = sum_lv / max(n_v, 1)
     true_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
     return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v)
+
+
+def _evaluate_valid_loss(valid_store, batch_size, raw_model,
+                         compute_props, compute_props_cached,
+                         use_autograd_forces, backend,
+                         pref_e, pref_f, pref_v, dtype, dev):
+    """Weighted loss + RMSEs of the frozen weights on the VALIDATION set.
+
+    Unlike ``_evaluate_true_loss`` this never touches ``b1``: the energy
+    offset is fitted on training data only (the analytical b1 update in the
+    epoch loop) — re-fitting it on validation energies would leak validation
+    information into the saved model. Energy MSE is therefore the plain
+    residual mean square with the current (train-fitted) b1.
+
+    Returns (valid_loss, rmse_e, rmse_f, rmse_v, rmse_stress_gpa).
+    """
+    from .constants import EV_PER_A3_TO_GPa
+    has_forces = valid_store.has_forces and pref_f > 0
+    has_virial = valid_store.has_virial and pref_v > 0
+    sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, _ = \
+        _accumulate_true_loss_sums(
+            valid_store, batch_size, raw_model,
+            compute_props, compute_props_cached,
+            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+    mse_e = sum_le / max(n_e, 1)
+    mse_f = sum_lf / max(n_f, 1)
+    mse_v = sum_lv / max(n_v, 1)
+    mse_s = sum_ls / max(n_v, 1)
+    valid_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
+    return (valid_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v),
+            np.sqrt(mse_s) * EV_PER_A3_TO_GPa)
 
 
 def _quiet_compile_logs():
@@ -1027,6 +1763,12 @@ def _compile_check(dev):
             return False, ("Triton not found (the CUDA TorchInductor backend "
                            "needs it) — install triton, or set "
                            "use_compile=False to silence this")
+    else:
+        # CPU Inductor generates and builds C++ — needs a compiler.
+        import shutil
+        if not any(shutil.which(c) for c in ("g++", "clang++", "c++")):
+            return False, ("no C++ compiler found (the CPU TorchInductor "
+                           "backend needs one) — falling back to eager")
     return True, ""
 
 
@@ -1040,22 +1782,35 @@ def train_nep(
     output_dir: str = ".",
     device: str = None,
     precision: str = "float32",
-    backend: str = "auto",
     use_autograd_forces: bool = False,
     use_swa: bool = False,
-    use_compile: bool = False,
-    print_interval: int = 10,
+    swa_start: int = None,
+    use_compile: bool = None,
+    print_interval: int = 1,
     restart: bool = True,
     checkpoint_interval: int = 100,
-    prediction_interval: int = 20,
+    prediction_interval: int = 100,
     finetune_from: str = None,
     resume_from: str = None,
     recompute_q_scaler: bool = False,
     slim_types: bool = False,
     energy_key: str = "energy",
-    use_gpumd_qscaler: bool = True,
+    use_gpumd_qscaler: bool = False,
+    run_seed: int = None,
+    valid_file: str = None,
+    valid_ratio: float = None,
+    valid_strategy: str = "stratified",
+    neighbor_mode: str = "auto",
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
+
+    ``neighbor_mode``: how the training data is held in host memory —
+    ``cached`` (full neighbor lists with displacement vectors, fastest),
+    ``compact`` (int32 indices + int8 image shifts, ~4x smaller, ``rij``
+    rebuilt on the device per batch), ``on_the_fly`` (positions + cells
+    only, the neighbor search runs on the device per batch — fits any
+    dataset). ``auto`` (default) takes the first of these whose estimated
+    peak footprint fits in 75% of this process's memory budget.
 
     Hyperparameters (epoch / batch / lr / lambda_e,f,v / stage2* / …) come
     from ``config_file`` only. See README for the full nep.in reference.
@@ -1067,17 +1822,20 @@ def train_nep(
     config_file, data_file, output_dir : paths.
     device : "cuda" | "cpu" | "mps" — auto-detected if omitted.
     precision : "float32" (default) or "float64".
-    backend : "auto" | "loop" | "bmm" — see torchnep.ops.resolve_backend.
     use_autograd_forces : True -> autograd-through-rij forces (slower, gold
-        standard); False (default) -> analytical chain rule.
+        standard); False (default) -> analytical chain rule. The type-pair
+        contraction backend is chosen automatically (see
+        torchnep.ops.resolve_backend).
     use_swa : True -> maintain an averaged model during stage 2 and save it
         as ``nep_average.txt`` at the end.
-    use_compile : torch.compile the analytical compute method (~1.3x faster per
+    swa_start : first epoch included in the SWA average (default: the
+        last 100 epochs). Averaging all of stage 2 degrades energies.
+    use_compile : None (default) = auto — compile on GPU, eager on
+        CPU; True/False force it. Missing Triton (GPU) or C++
+        toolchain (CPU) degrades to eager with a log note.
         epoch after a one-time first-epoch compilation cost; needs Triton, which
-        ships with the CUDA PyTorch build). Ignored on the autograd force path
-        (incompatible with its double-backward). For an extra ~1.3x when memory
-        allows, also pass backend="bmm" (faster under compile but higher peak
-        memory — see docs/torch_compile.md).
+        ships with the CUDA PyTorch build). With autograd forces the
+        first-order gradient is materialized via make_fx and compiled too.
     print_interval : log a line to screen every N epochs (all epochs still
         land in output.log).
     restart : on fresh output_dir, write new log; otherwise resume from
@@ -1105,14 +1863,38 @@ def train_nep(
     energy_key : name of the comment-line tag read as the reference energy
         (default ``"energy"``). Set to ``"atomization_energy"`` to train
         against atomization energies instead of totals.
-    use_gpumd_qscaler : Default True — reproduce GPUMD's initialization:
-        descriptor coefficients are re-initialised uniform(-1, 1) and the
-        q_scaler is computed with all coefficients = 1.0 (GPUMD's generation-0
-        ``initial_para``). False uses the self-consistent q_scaler (computed
-        from the model's actual init coefficients). Only applies to fresh
-        training (ignored under finetune_from).
+    use_gpumd_qscaler : Default False — torch's default init with the
+        self-consistent q_scaler (computed from the model's actual init
+        coefficients). On a 600-epoch 4-seed PdCuNiP benchmark this
+        converges to clearly better minima than the GPUMD-style start
+        (~12% lower E/V RMSE, ~3% lower F, train and validation alike).
+        True reproduces GPUMD's initialization instead: every parameter
+        re-initialised uniform(-1, 1) (SNES mu init) and the q_scaler
+        computed with all coefficients = 1.0 (GPUMD's generation-0
+        ``initial_para``) — useful for GPUMD-comparison runs. Either way
+        the saved nep.txt is fully GPUMD-compatible (the scaler is stored
+        in the file). Only applies to fresh training (ignored under
+        finetune_from).
+    run_seed : master RNG seed for this run. None (default) -> a fresh random
+        seed each run, so repeated runs differ (independent weight init AND
+        per-epoch batch shuffle) — the stochastic-testing behaviour. Pass an
+        int to make a run fully reproducible: the same seed reproduces both
+        the initial weights and the batch ordering bit-for-bit. The seed is
+        saved into checkpoint.pt and restored on resume, so a resumed run
+        continues along the very same shuffle stream regardless of what seed
+        (or None) is passed at resume time.
+    valid_file : path to a validation .xyz. Evaluated (frozen weights, full
+        set) every epoch: nep_best is the epoch with the lowest validation
+        loss and the plateau LR scheduler steps on the validation loss —
+        both anti-overfitting. Writes GPUMD-style *_test.out files.
+    valid_ratio : alternative to valid_file — hold out this fraction of
+        data_file (e.g. 0.1) as the validation set. The split is drawn from
+        run_seed, so it is reproducible for a given seed and is preserved
+        exactly on resume (the checkpoint's seed wins). Mutually exclusive
+        with valid_file.
     """
     _clean_warning_format()
+    _default_alloc_conf()
 
     # ---- Device ----------------------------------------------------------
     if device is None:
@@ -1150,17 +1932,14 @@ def train_nep(
         _log(line)
     _log("")
     config = orig_config
-    # Model regularisation coefficients
-    lambda_1 = config["lambda_1"]
-    lambda_2 = config["lambda_2"]
     # Training schedule + loss weights
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
     lr                 = config["lr"]
     stop_lr            = config["stop_lr"]
     scheduler_patience = config["scheduler_patience"]
+    early_stop         = int(config.get("early_stop", 0))  # 0 = off
     scheduler_factor   = config["scheduler_factor"]
-    early_stop_patience = config.get("early_stop_patience")  # None -> disabled
     lr_scheduler_mode  = config["lr_scheduler"]     # "plateau" | "step"
     max_grad_norm      = config["max_grad_norm"]
     pref_e             = config["lambda_e"]
@@ -1182,12 +1961,80 @@ def train_nep(
     stage2_scheduler_factor   = config.get("stage2_scheduler_factor",
                                            scheduler_factor)
 
+    # ---- Resume target + master RNG seed (BEFORE data loading) ------------
+    # The seed must be settled before the data section because the validation
+    # split (valid_ratio) is drawn from it — and on resume the checkpoint's
+    # saved seed must win, or the resumed run would carve out a DIFFERENT
+    # validation subset and leak old validation frames into training. Only
+    # the seed is peeked here; the full checkpoint load happens later, after
+    # model/optimizer construction.
+    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    if resume_from is not None and finetune_from is not None:
+        raise ValueError("resume_from and finetune_from are mutually "
+                         "exclusive: resume_from continues a run, "
+                         "finetune_from starts a new one from weights")
+    resume_ckpt = None
+    if resume_from is not None:
+        if not os.path.exists(resume_from):
+            raise FileNotFoundError(f"resume_from: {resume_from} not found")
+        resume_ckpt = resume_from
+    elif restart and os.path.exists(ckpt_path) and finetune_from is None:
+        resume_ckpt = ckpt_path
+    if resume_ckpt is not None:
+        _saved_seed = torch.load(resume_ckpt, map_location="cpu",
+                                 weights_only=False).get("run_seed")
+        if _saved_seed is not None:
+            run_seed = _saved_seed  # continue the original streams + split
+    if run_seed is None:
+        import random
+        run_seed = random.randrange(1, 2**31 - 1)
+
     # ---- Data ------------------------------------------------------------
     _log("Data")
     _log("----")
     frames = read_xyz(data_file, energy_key=energy_key)
     _log(f"  read {len(frames)} structures from {data_file} "
          f"(energy label: {energy_key})")
+
+    # ---- Validation set ----------------------------------------------------
+    # valid_file: separate .xyz. valid_ratio: hold out a random fraction of
+    # data_file, drawn from run_seed via a dedicated generator (the global
+    # torch RNG is untouched, so weight init matches a no-valid run). Sorted
+    # indices keep the *_test.out rows in input-xyz order.
+    if valid_file is not None and valid_ratio is not None:
+        raise ValueError("valid_file and valid_ratio are mutually exclusive")
+    valid_frames = None
+    if valid_file is not None:
+        valid_frames = read_xyz(valid_file, energy_key=energy_key)
+        _log(f"  read {len(valid_frames)} validation structures "
+             f"from {valid_file}")
+    elif valid_ratio is not None:
+        # The same draw export_valid_split reproduces (see data.py) — the
+        # split can be exported as GPUMD-ready train.xyz/test.xyz files.
+        if valid_strategy == "stratified":
+            metas = [(f["natoms"], f["species"]) for f in frames]
+            train_idx, val_idx, st = stratified_split_indices(
+                metas, valid_ratio, run_seed)
+            _log(f"  valid_ratio={valid_ratio} (stratified by composition x "
+                 f"cell size): {st['n_strata']} strata; "
+                 f"{st['n_tiny_frames']} tiny-cell (<=4 atoms) frames and "
+                 f"{st['n_rare_frames']} rare-stratum frames kept fully in "
+                 f"training; held out {len(val_idx)} frames, "
+                 f"{len(train_idx)} remain (split drawn from run_seed)")
+            if st.get("fallback") == "random":
+                _log("  stratified split starved the validation set "
+                     "(dataset is dominated by tiny/rare strata) — fell "
+                     "back to a random split with the same seed")
+        elif valid_strategy == "random":
+            train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
+                                                     run_seed)
+            _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} "
+                 f"frames for validation, {len(train_idx)} remain for "
+                 f"training (split drawn from run_seed)")
+        else:
+            raise ValueError(f"unknown valid_strategy: {valid_strategy!r}")
+        valid_frames = [frames[i] for i in val_idx]
+        frames = [frames[i] for i in train_idx]
 
     # Single-GPU: per-epoch shuffle is done at iteration time via
     # torch.randperm(n_structs). We deliberately do NOT pre-sort by natoms
@@ -1198,11 +2045,14 @@ def train_nep(
     n_structs = len(frames)
 
     # slim_types: detect which element types actually appear in the data and
-    # narrow config before building neighbor lists / GPUDataStore / model.
+    # narrow config before building neighbor lists / data store / model.
     # This makes the entire training run faster, not just the output file.
     _slim_keep = None  # None = no slimming; list = types to keep
     if slim_types:
         seen_species = set(s for f in frames for s in f["species"])
+        if valid_frames is not None:
+            seen_species |= set(s for f in valid_frames
+                                for s in f["species"])
         keep = [t for t in orig_config["type_names"] if t in seen_species]
         removed = [t for t in orig_config["type_names"] if t not in keep]
         if removed:
@@ -1217,43 +2067,95 @@ def train_nep(
 
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
-    structures = preprocess_structures(frames, config, np_dtype)
-    _log(f"  built neighbor lists in {time.time() - t0:.1f}s")
+    nmode, est, budget = choose_neighbor_mode(
+        frames + (valid_frames or []), config, neighbor_mode,
+        itemsize=np.dtype(np_dtype).itemsize)
+    _log(f"  neighbor_mode: {nmode} (requested {neighbor_mode}; estimate "
+         f"cached {_fmt_gb(est['cached'])} / compact {_fmt_gb(est['compact'])}"
+         f" / on_the_fly {_fmt_gb(est['on_the_fly'])}"
+         + (f", budget {_fmt_gb(budget)})" if budget else ")"))
+    structures = preprocess_structures(frames, config, np_dtype, mode=nmode)
+    del frames                      # parsed frames are not needed any more
+    _log(f"  built neighbor lists in {time.time() - t0:.1f}s"
+         if nmode != "on_the_fly" else
+         f"  prepared geometry in {time.time() - t0:.1f}s")
 
     max_NN_rad, max_NN_ang = compute_max_neighbors(structures)
 
     t0 = time.time()
-    data_store = GPUDataStore(structures, dev, dtype, config=config)
+    data_store = StreamDataStore(structures, dev, dtype, config=config,
+                                 neighbor_mode=nmode)
     del structures
+    if nmode == "on_the_fly":
+        max_NN_rad, max_NN_ang = data_store.scan_max_neighbors()
     if dev.type == "cuda":
         torch.cuda.synchronize()
-    _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
+    _log(f"  data store ready ({nmode}, {_fmt_gb(data_store.memory_bytes())} "
+         f"of pair/geometry data): dataset in host memory, batches streamed "
+         f"to {dev} ({time.time() - t0:.1f}s)")
     _log(f"  coverage: {data_store.n_energy} E / "
          f"{data_store.n_forces} F / {data_store.n_virial} V")
+
+    valid_store = None
+    if valid_frames is not None:
+        t0 = time.time()
+        structures_v = preprocess_structures(valid_frames, config, np_dtype,
+                                             mode=nmode)
+        # nep.txt records max neighbor counts for MD buffer sizing — cover
+        # the validation frames too (in ratio mode they came from data_file,
+        # so this matches what a no-valid run would have written).
+        vNN_rad, vNN_ang = compute_max_neighbors(structures_v)
+        valid_store = StreamDataStore(structures_v, dev, dtype, config=config,
+                                      neighbor_mode=nmode)
+        if nmode == "on_the_fly":
+            vNN_rad, vNN_ang = valid_store.scan_max_neighbors()
+        max_NN_rad = max(max_NN_rad, vNN_rad)
+        max_NN_ang = max(max_NN_ang, vNN_ang)
+        del structures_v, valid_frames
+        _log(f"  validation set ready in {time.time() - t0:.1f}s — "
+             f"coverage: {valid_store.n_energy} E / "
+             f"{valid_store.n_forces} F / {valid_store.n_virial} V")
     _log("")
+
+    # ---- Master RNG seed -------------------------------------------------
+    # Seed the global torch RNG BEFORE model construction so both the NN weight
+    # init (model.py nn.init.*) and the descriptor-coeff re-init below draw
+    # deterministically from it. A given run_seed therefore fixes the initial
+    # weights; the same seed also drives the per-epoch shuffle (see the loop).
+    # The seed itself was settled before data loading (checkpoint's seed on
+    # resume, user int, or a fresh random draw) — see the resume/seed block.
+    torch.manual_seed(run_seed)
+
 
     # ---- Model -----------------------------------------------------------
     _log("Model")
     _log("-----")
+    _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
 
-    # use_gpumd_qscaler: reproduce GPUMD's init for fresh training — descriptor
-    # coefficients uniform(-1, 1) (GPUMD initialises every parameter this way)
-    # paired with the c=1 q_scaler computed below. Skipped under finetune_from,
-    # where the loaded trained coefficients must be kept.
+    # use_gpumd_qscaler: reproduce GPUMD's init for fresh training. GPUMD (SNES
+    # mu init, snes.cu initialize_mu_and_sigma) draws EVERY parameter
+    # uniform(-1, 1) — both the descriptor coefficients and the NN weights — so
+    # to stay consistent we re-init both here, paired with the c=1 q_scaler
+    # computed below. Re-initialising the descriptor coeffs alone would leave the
+    # NN at torch's small-variance init, whose shallow binding landscape does not
+    # match the one GPUMD's models inherit from their large init. Skipped under
+    # finetune_from, where the loaded trained parameters must be kept.
     if use_gpumd_qscaler and finetune_from is None:
-        with torch.no_grad():
-            torch.nn.init.uniform_(model.c_param_2, -1.0, 1.0)
-            if model.c_param_3 is not None:
-                torch.nn.init.uniform_(model.c_param_3, -1.0, 1.0)
-        _log("  use_gpumd_qscaler: descriptor coeffs re-init uniform(-1,1), "
-             "q_scaler will use c=1 (GPUMD-consistent)")
+        gpumd_init_parameters(model)
+        _log("  use_gpumd_qscaler: descriptor coeffs + NN weights re-init "
+             "uniform(-1,1), q_scaler will use c=1 (GPUMD-consistent)")
 
     # b1 (global energy offset) is determined analytically each epoch, not by
     # gradient descent (see recompute_b1_shift) — exclude it from the optimizer.
     model.b1.requires_grad_(False)
-    trainable_params = [p for n, p in model.named_parameters() if n != "b1"]
-
+    trainable_named = [(n, p) for n, p in model.named_parameters()
+                       if n != "b1"]
+    # Number of trainable variables — the divisor GPUMD uses to turn the raw
+    # L1/L2 sums into a mean(|w|) and RMS(w) (see the reg block in the epoch
+    # loop). GPUMD's number_of_variables also counts the single global energy
+    # shift (our b1), which we train analytically; the 1-param difference is
+    # negligible against the thousands of weights here.
     if finetune_from is not None:
         # Load pre-trained weights; skip random b1 init from mean_epa.
         # The stored q_scaler is part of the loaded model and is KEPT (see
@@ -1297,6 +2199,13 @@ def train_nep(
     # backend — the backend choice depends on it. Only the analytical path is
     # compiled; the autograd path's create_graph=True double backward is
     # incompatible with compile, so it stays eager.
+    # use_compile=None means AUTO: compile on GPU (where it is 3-5x),
+    # stay eager on CPU (C++ Inductor warmup outweighs the gain for
+    # typical CPU-sized runs). Explicit True/False always wins; every
+    # failed capability check degrades to eager with a log line instead
+    # of raising.
+    if use_compile is None:
+        use_compile = dev.type in ("cuda", "xpu")
     compile_on = False
     compile_msg = None
     if use_compile:
@@ -1304,28 +2213,29 @@ def train_nep(
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
         elif use_autograd_forces:
-            compile_msg = ("  torch.compile: skipped — incompatible with "
-                           "autograd double-backward forces")
+            # The nested create_graph=True double backward cannot be lowered
+            # directly, but the make_fx route (materialize the first-order
+            # gradient as ordinary FX ops, then compile) can — see
+            # torchnep/compiled_autograd.py.
+            compile_on = True
+            compile_msg = ("  torch.compile: enabled (autograd forces via "
+                           "make_fx-materialized gradient)")
         else:
             compile_on = True
             compile_msg = "  torch.compile: enabled (analytical compute method)"
 
-    # Resolve "auto" backend. ``backend`` is the eager backend for the one-shot
-    # q_scaler pass (num_types-based: loop for few types, bmm for >=8).
-    # ``train_backend`` is what the per-batch compute uses — bmm whenever
-    # compiling (it fuses best under Inductor). An explicit backend= wins for
-    # both; the two backends are numerically identical.
+    # Backends are chosen automatically: ``backend`` is the eager choice
+    # (q_scaler / eval passes), ``train_backend`` adds the use_compile rule
+    # (mulsum under compile). See ops.resolve_backend for the policy and the
+    # MI250X/V100/A2000 benchmarks behind it.
     from .ops import resolve_backend as _resolve_backend
-    orig_backend = backend
-    backend = _resolve_backend(orig_backend, num_types=model.num_types)
-    train_backend = _resolve_backend(
-        orig_backend, num_types=model.num_types, use_compile=compile_on)
+    backend = _resolve_backend("auto", num_types=model.num_types,
+                               device_type=dev.type)
+    train_backend = _resolve_backend("auto", num_types=model.num_types,
+                                     use_compile=compile_on,
+                                     device_type=dev.type)
     force_str = "autograd" if use_autograd_forces else "analytical"
-    if train_backend != backend:
-        _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
-             f"forces: {force_str}")
-    else:
-        _log(f"  backend: {backend}, forces: {force_str}")
+    _log(f"  forces: {force_str}")
 
     if finetune_from is not None and not recompute_q_scaler:
         # The q_scaler is part of the potential definition: the loaded NN
@@ -1339,7 +2249,11 @@ def train_nep(
                  "(recompute_q_scaler=True) — the loaded weights will "
                  "see rescaled descriptors and must re-adapt")
         t0 = time.time()
+        # The q-scaler pass uses the training batch size so its transient
+        # GPU footprint stays batch-bound (min/max over the dataset is
+        # chunking-invariant, so the result is unchanged).
         q_min, q_max = compute_q_scaler(model, data_store, backend=backend,
+                                        batch_size=batch_size,
                                         gpumd_init=use_gpumd_qscaler)
         model.set_q_scaler(q_min, q_max)
         if dev.type == "cuda":
@@ -1356,16 +2270,39 @@ def train_nep(
     compute_props_cached = raw_model.compute_properties_cached
     if compile_on:
         _quiet_compile_logs()
-        compute_props_cached = torch.compile(
-            raw_model.compute_properties_cached, dynamic=True)
+        if use_autograd_forces:
+            from .compiled_autograd import CompiledAutogradForce
+            compute_props = CompiledAutogradForce(raw_model).compute_properties
+        else:
+            # Compile the branch-free core only — ZBL and result assembly
+            # stay eager in the wrapper. Compiling the whole method instead
+            # leaves 3 graph breaks (per-type masks + ZBL autograd.grad) and
+            # ~2.7x the kernel launches.
+            import functools
+            _compiled_core = torch.compile(raw_model._cached_core,
+                                           dynamic=True)
+            compute_props_cached = functools.partial(
+                raw_model.compute_properties_cached, core_fn=_compiled_core)
+            # Fuse the per-batch basis kernels too — same numerical status
+            # as the compiled compute (~1e-7 Inductor deviations).
+            data_store.compile_basis()
+            if valid_store is not None:
+                valid_store.compile_basis()
     if compile_msg is not None:
         _log(compile_msg)
 
-    optimizer = torch.optim.Adam(trainable_params, lr=lr,
-                                 weight_decay=lambda_2, amsgrad=True)
+    weight_decay = config["weight_decay"]
+    optimizer = _make_optimizer(trainable_named, lr, weight_decay)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
+
+    # SWA window: average only the tail of the run (default: the last 100
+    # epochs). Averaging the whole of stage 2 drags the energy back toward
+    # mid-descent weights (E converges late); the tail is a converged
+    # cloud, so averaging there is pure noise reduction.
+    if swa_start is None:
+        swa_start = max(1, num_epochs - 99)
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
@@ -1392,32 +2329,45 @@ def train_nep(
         "stage2_pref_v": stage2_pref_v,
     }
 
-    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    # resume_ckpt / ckpt_path were resolved before data loading (the seed
+    # peek); here the full training state is actually restored.
     start_epoch = 1
     best_loss = float("inf")
     best_true_loss = float("inf")
-    epochs_since_best_true_loss = 0  # early_stop_patience bookkeeping
+    best_valid_loss = float("inf")
+    cur_valid_info = {"valid_file": valid_file, "valid_ratio": valid_ratio}
+    if valid_strategy != "random":
+        cur_valid_info["valid_strategy"] = valid_strategy
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
-    if resume_from is not None and finetune_from is not None:
-        raise ValueError("resume_from and finetune_from are mutually "
-                         "exclusive: resume_from continues a run, "
-                         "finetune_from starts a new one from weights")
-    resume_ckpt = None
-    if resume_from is not None:
-        if not os.path.exists(resume_from):
-            raise FileNotFoundError(f"resume_from: {resume_from} not found")
-        resume_ckpt = resume_from
-    elif restart and os.path.exists(ckpt_path) and finetune_from is None:
-        resume_ckpt = ckpt_path
     if resume_ckpt is not None:
         info = _load_checkpoint(resume_ckpt, model, optimizer,
                                 lr_scheduler, stage2_scheduler,
                                 swa_model, dev)
+        # load_state_dict restores the checkpoint's param_groups, which
+        # would silently zero a newly requested weight_decay — reapply it.
+        if weight_decay > 0:
+            for _g in optimizer.param_groups:
+                _g["weight_decay"] = weight_decay
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
+        best_valid_loss = info["best_valid_loss"]
+        # A checkpoint already in stage 2 pins the EFFECTIVE stage-2 start —
+        # possibly earlier than nep.in's, when a stage-1 early stop jumped
+        # ahead of schedule. Stage-1 checkpoints defer to nep.in (so the
+        # redo-stage-2-with-edited-settings flow keeps working).
+        if stage2 and info["in_stage2"] and info.get("start_stage2") is not None:
+            start_stage2 = info["start_stage2"]
+        saved_valid_info = info.get("valid_info")
+        if saved_valid_info is not None and saved_valid_info != cur_valid_info:
+            _log("WARNING: validation settings changed since the checkpoint "
+                 "was saved — the train/valid split is NOT the one this run "
+                 "started with (old validation frames may enter training).")
+            _log(f"  saved:   {saved_valid_info}")
+            _log(f"  current: {cur_valid_info}")
+            best_valid_loss = float("inf")
         _log(f"Resumed from {resume_ckpt}: epoch {start_epoch - 1}, "
-             f"best_loss={best_loss:.4e}")
+             f"best_loss={best_loss:.4e}, run_seed={run_seed}")
         # Resume = exact continuation: lr (and the whole optimizer state)
         # comes from the checkpoint moment. nep.in's lr only applies to
         # fresh runs / finetunes — and stage2_lr at a fresh stage-2 entry.
@@ -1433,6 +2383,7 @@ def train_nep(
             _log(f"  current: {cur_loss_weights}")
             best_loss = float("inf")
             best_true_loss = float("inf")
+            best_valid_loss = float("inf")
 
     n_structs = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
@@ -1449,8 +2400,15 @@ def train_nep(
                     or os.path.getsize(loss_log_path) == 0)
     loss_log = open(loss_log_path, "w" if start_epoch == 1 else "a")
     if write_header:
-        loss_log.write("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
-                       "rmse_v(eV/atom)  rmse_stress(GPa)\n")
+        hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
+               "rmse_v(eV/atom)  rmse_stress(GPa)")
+        if valid_store is not None:
+            # GPUMD loss.out convention: train RMSEs, then test RMSEs.
+            # (The loss column is then the VALIDATION loss — it is what
+            # drives the scheduler and the best-model choice.)
+            hdr += ("  rmse_e_test(eV/atom)  rmse_f_test(eV/A)  "
+                    "rmse_v_test(eV/atom)  rmse_stress_test(GPa)")
+        loss_log.write(hdr + "\n")
 
     # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
     # already printed by format_config_summary above; here we just announce
@@ -1463,6 +2421,14 @@ def train_nep(
     # written (see the best-save block in the loop).
     true_eval_start = (2 * num_epochs) // 3 + 1
     _log("")
+    if early_stop:
+        monitored = "validation loss" if valid_store is not None else "train loss"
+        if early_stop <= scheduler_patience:
+            _log(f"WARNING: early_stop ({early_stop}) <= scheduler_patience "
+                 f"({scheduler_patience}); the LR may never decay before the "
+                 f"run stops. Use early_stop > scheduler_patience.")
+        _log(f"Early stopping: stop if {monitored} does not improve for "
+             f"{early_stop} epochs")
     _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
     _log("=" * 72)
 
@@ -1471,7 +2437,23 @@ def train_nep(
             os.path.join(output_dir, "nep_best.txt"),
             max_NN_rad, max_NN_ang)
 
+    # Early-stopping tracker on the monitored metric (sched_loss: validation
+    # loss when a valid set is present, else the epoch train loss). Reset when
+    # stage 2 starts, since the loss scale changes with the stage-2 weights.
+    es_best = float("inf")
+    es_wait = 0
+    prev_in_stage2 = False
+
     train_t0 = time.time()
+
+    # Non-finite-gradient guard flavour: with a fused CUDA optimizer the
+    # skip runs GPU-side via the AMP found_inf hook (no per-step host
+    # sync — the sync otherwise costs a full launch-pipeline stall every
+    # step); anywhere else the classic synchronous check runs.
+    async_guard = (dev.type == "cuda"
+                   and optimizer.param_groups[0].get("fused", False)
+                   and getattr(optimizer, "_step_supports_amp_scaling",
+                               False))
 
     try:
         for epoch in range(start_epoch, num_epochs + 1):
@@ -1479,17 +2461,21 @@ def train_nep(
             model.train()
 
             # Per-epoch frame-level shuffle (i.i.d. minibatches). Seeded by
-            # epoch so reruns are reproducible and resumed runs continue
-            # along the same stream.
+            # run_seed + epoch: distinct order every epoch, reproducible for a
+            # given run_seed, and resumed runs continue along the same stream
+            # (run_seed is restored from the checkpoint).
             g = torch.Generator()
-            g.manual_seed(epoch)
+            g.manual_seed(run_seed + epoch)
             perm = torch.randperm(n_structs, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = 0.0
-            sum_ls = 0.0                     # (eV/A**3)**2 accumulator for stress
-            sum_e_structs = sum_f_atoms = sum_v_structs = 0
-            sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
-            max_gn = 0.0
+            # Metric accumulators live on the DEVICE and are fetched once
+            # per epoch — per-step .item() reads would stall the launch
+            # pipeline (the CPU must run a full step ahead of the GPU for
+            # the streamed collate + kernel launches to hide).
+            # Layout: [sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, resid]
+            acc = torch.zeros(8, dtype=torch.float64, device=dev)
+            max_gn_t = torch.zeros((), dtype=dtype, device=dev)
+            n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
@@ -1520,7 +2506,9 @@ def train_nep(
                             model, optimizer, lr_scheduler, epoch - 1,
                             best_loss, loss_weights=cur_loss_weights,
                             in_stage2=False, swa_model=None,
-                            best_true_loss=best_true_loss)
+                            best_true_loss=best_true_loss, run_seed=run_seed,
+                            best_valid_loss=best_valid_loss,
+                            valid_info=cur_valid_info)
                         _log("Saved end-of-stage-1 checkpoint: "
                              "checkpoint_stage1.pt (redo stage 2 from it "
                              "via resume_from)")
@@ -1528,6 +2516,7 @@ def train_nep(
                             pg['lr'] = stage2_lr
                         best_loss = float("inf")
                         best_true_loss = float("inf")
+                        best_valid_loss = float("inf")
                         _log(f"Stage 2 started at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
                              f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
@@ -1554,9 +2543,15 @@ def train_nep(
             has_forces = data_store.has_forces and cur_pref_f > 0
             has_virial = data_store.has_virial and cur_pref_v > 0
 
-            for start in range(0, n_structs, batch_size):
-                idx = perm[start:start + batch_size]
-                batch = data_store.collate(idx)
+            batch_indices = [perm[start:start + batch_size]
+                             for start in range(0, n_structs, batch_size)]
+            _tp = [0.0, 0.0]
+            if _PROF and dev.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+            _t_loop0 = time.perf_counter()
+            for batch in _timed_iter(
+                    iter_collated(data_store, batch_indices),
+                    _tp, _PROF >= 2 and dev.type == "cuda"):
 
                 if use_autograd_forces:
                     result = compute_props(
@@ -1574,81 +2569,133 @@ def train_nep(
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
-                e_mask = batch["energy_mask"]
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
-                # sum_l* accumulates per-batch MSE so the rmse_* columns in
-                # the log are real RMSE. Optimizer sees _loss_fn (MSE) too.
-                if e_mask.any():
-                    diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
-                    loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
-                    loss = loss + cur_pref_e * loss_e
-                    sum_le += (diff_e ** 2).mean().item() * e_mask.sum().item()
-                    # Accumulate the signed residual for the analytical b1
-                    # update (folded into this pass — no extra forward).
-                    sum_e_resid += diff_e.sum().item()
+                # Loss + metrics are built BRANCHLESSLY (masked weighted
+                # sums, host-side has_* flags) and kept as device scalars:
+                # boolean-mask indexing or `.any()` here would drain the
+                # compute stream mid-step. The scalars are fetched together
+                # AFTER the one unavoidable sync (the grad-norm guard), where
+                # the reads are free. Same math as the old masked-select
+                # form: sum(d^2 * mask) / sum(mask) == mean over selected.
+                m_le = m_resid = m_lf = m_lv = m_ls = None
+                if batch["has_e"]:
+                    emf = batch["energy_mask"].to(dtype)
+                    ne_b = emf.sum()
+                    de = (e_pa_pred - e_pa_ref) * emf
+                    loss = loss + cur_pref_e * ((de ** 2).sum() / ne_b)
+                    m_le = (de ** 2).sum()
+                    # Signed residual for the analytical b1 update (folded
+                    # into this pass — no extra forward).
+                    m_resid = de.sum()
 
-                if has_forces:
-                    f_mask = batch["force_mask"]
-                    if f_mask.any():
-                        f_pred = result["forces"][f_mask]
-                        f_ref = batch["forces"][f_mask]
-                        loss_f = _loss_fn(f_pred, f_ref)
-                        loss = loss + cur_pref_f * loss_f
-                        sum_lf += ((f_pred - f_ref) ** 2).mean().item() * f_mask.sum().item()
+                if has_forces and batch["has_f"]:
+                    fmf = batch["force_mask"].to(dtype).unsqueeze(-1)
+                    nf_b = fmf.sum()
+                    df = (result["forces"] - batch["forces"]) * fmf
+                    loss = loss + cur_pref_f * ((df ** 2).sum() / (3.0 * nf_b))
+                    m_lf = (df ** 2).sum() / 3.0
 
-                if has_virial and "virial" in result:
-                    v_mask = batch["virial_mask"]
-                    if v_mask.any():
-                        v_atom = result["virial"]
+                if (has_virial and "virial" in result and batch["has_v"]
+                        and batch["virial"].shape[1] == 9):
+                    vmf = batch["virial_mask"].to(dtype).unsqueeze(-1)
+                    nv_b = vmf.sum()
+                    na = batch["natoms"].unsqueeze(-1)
+
+                    def _v_pred_pa(res):
                         v_sys = torch.zeros(batch["num_structures"], 9,
                                             dtype=dtype, device=dev)
-                        si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
-                        v_sys.scatter_add_(0, si, v_atom)
-                        v_ref = batch["virial"]
-                        if v_ref.shape[1] == 9:
-                            na = batch["natoms"][v_mask].unsqueeze(-1)
-                            # 6 unique components only (see _VIRIAL_6).
-                            v_pred_pa = v_sys[:, _VIRIAL_6][v_mask] / na
-                            v_ref_pa = v_ref[:, _VIRIAL_6][v_mask] / na
-                            loss_v = _loss_fn(v_pred_pa, v_ref_pa)
-                            loss = loss + cur_pref_v * loss_v
-                            v_diff = v_pred_pa - v_ref_pa
-                            sum_lv += (v_diff ** 2).mean().item() * v_mask.sum().item()
-                            # Stress RMSE (eV/A**3): convert the same diff using
-                            # per-frame (natoms/volume). Sign cancels under MSE.
-                            scale = (batch["natoms"][v_mask]
-                                     / batch["volumes"][v_mask]).unsqueeze(-1)
-                            s_diff = v_diff * scale
-                            sum_ls += (s_diff ** 2).mean().item() * v_mask.sum().item()
-
-                if lambda_1 > 0:
-                    l1 = sum(p.abs().sum() for p in trainable_params)
-                    loss = loss + lambda_1 * l1
+                        si = batch["struct_idx"].unsqueeze(-1).expand_as(
+                            res["virial"])
+                        v_sys.scatter_add_(0, si, res["virial"])
+                        return v_sys[:, _VIRIAL_6] / na
+                    # 6 unique components only (see _VIRIAL_6).
+                    v_ref_pa = batch["virial"][:, _VIRIAL_6] / na
+                    v_pred_pa = _v_pred_pa(result)
+                    dv = (v_pred_pa - v_ref_pa) * vmf
+                    loss = loss + cur_pref_v * ((dv ** 2).sum() / (6.0 * nv_b))
+                    m_lv = (dv ** 2).sum() / 6.0
+                    # Stress RMSE (eV/A**3): convert the same diff using
+                    # per-frame (natoms/volume). Sign cancels under MSE.
+                    # clamp: masked-out frames may carry volume 0 — their
+                    # contribution is already zeroed by the mask factor.
+                    scale = (batch["natoms"]
+                             / batch["volumes"].clamp(min=1e-9)).unsqueeze(-1)
+                    m_ls = ((dv * scale) ** 2).sum() / 6.0
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
                 if max_grad_norm > 0:
-                    gn = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_grad_norm).item()
+                    gn_t = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm)
                 else:
-                    gn = torch.sqrt(sum(
+                    gn_t = torch.sqrt(sum(
                         p.grad.norm()**2 for p in raw_model.parameters()
-                        if p.grad is not None)).item()
+                        if p.grad is not None))
 
-                if not np.isfinite(gn):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
+                if async_guard:
+                    # Non-finite-gradient protection WITHOUT a host sync:
+                    # the fused Adam kernel skips the whole update GPU-side
+                    # when ``found_inf`` is nonzero (the AMP mechanism), so
+                    # the parameters are protected exactly as with the
+                    # synchronous skip. Divergence from the sync path only
+                    # on the (pathological, ~never) bad step itself: SWA
+                    # still averages the (unchanged) weights, and that
+                    # step's metrics are excluded via the same flag.
+                    bad = (~torch.isfinite(gn_t)).to(dtype)
+                    optimizer.found_inf = bad
+                    optimizer.step()
+                    n_bad_t += bad
+                    ok_f = (1.0 - bad).to(torch.float64)
+                else:
+                    gn = float(gn_t)
+                    if not np.isfinite(gn):
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    optimizer.step()
+                    ok_f = 1.0
 
-                optimizer.step()
-
-                if in_stage2 and swa_model is not None:
+                if (in_stage2 and swa_model is not None
+                        and epoch >= swa_start):
                     swa_model.update_parameters(raw_model)
 
-                sum_e_structs += batch["energy_mask"].sum().item()
-                sum_f_atoms += batch["force_mask"].sum().item()
-                sum_v_structs += batch["virial_mask"].sum().item()
-                max_gn = max(max_gn, gn)
+                # Device-side metric accumulation — one fused add per step,
+                # fetched once per epoch. Bad steps contribute zero via ok_f
+                # (consistently for sums AND counts).
+                zero64 = acc.new_zeros(())
+                acc += ok_f * torch.stack([
+                    m_le.double() if m_le is not None else zero64,
+                    m_lf.double() if m_lf is not None else zero64,
+                    m_lv.double() if m_lv is not None else zero64,
+                    m_ls.double() if m_ls is not None else zero64,
+                    (batch["energy_mask"].sum().double()
+                     if m_le is not None else zero64),
+                    (batch["force_mask"].sum().double()
+                     if m_lf is not None else zero64),
+                    (batch["virial_mask"].sum().double()
+                     if m_lv is not None else zero64),
+                    m_resid.double() if m_resid is not None else zero64,
+                ])
+                max_gn_t = torch.maximum(
+                    max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
+
+            if _PROF:
+                if dev.type == "cuda":
+                    torch.cuda.synchronize()
+                _t_train_wall = time.perf_counter() - _t_loop0
+
+            # One epoch-level fetch of every device accumulator (the only
+            # metric sync of the epoch).
+            (sum_le, sum_lf, sum_lv, sum_ls, n_e_f, n_f_f, n_v_f,
+             sum_e_resid) = acc.tolist()
+            sum_e_structs = int(round(n_e_f))
+            sum_f_atoms = int(round(n_f_f))
+            sum_v_structs = int(round(n_v_f))
+            max_gn = float(max_gn_t)
+            n_bad = int(n_bad_t)
+            if n_bad:
+                _log(f"  warning: {n_bad} step(s) skipped this epoch "
+                     f"(non-finite gradient norm)")
 
             # Analytical b1 (GPUMD-style), folded into the training pass: b1
             # absorbs this epoch's mean per-atom energy residual. Updated AFTER
@@ -1674,26 +2721,92 @@ def train_nep(
             rmse_f = np.sqrt(mse_f)
             rmse_v = np.sqrt(mse_v)
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa
+
+            # Validation: frozen-weight full pass every epoch (b1 already
+            # train-fitted by the analytical update above; never re-fitted on
+            # validation data). This loss drives the plateau scheduler and
+            # the best-model choice below — the anti-overfitting signal.
+            _t_v0 = time.perf_counter()
+            valid_loss = None
+            if valid_store is not None:
+                valid_loss, v_rmse_e, v_rmse_f, v_rmse_v, v_rmse_s = \
+                    _evaluate_valid_loss(
+                        valid_store, batch_size, raw_model,
+                        compute_props, compute_props_cached,
+                        use_autograd_forces, train_backend,
+                        cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
+            if _PROF and dev.type == "cuda":
+                torch.cuda.synchronize()
+            _t_valid = time.perf_counter() - _t_v0
             dt = time.time() - t_epoch
 
+            # With a validation set, the validation loss IS the run's loss:
+            # it drives the plateau scheduler, the best-model choice, and the
+            # displayed/logged "loss" value (the train RMSE columns remain).
+            sched_loss = valid_loss if valid_loss is not None else avg_loss
             if in_stage2 and stage2_scheduler is not None:
-                _scheduler_step(stage2_scheduler, avg_loss,
+                _scheduler_step(stage2_scheduler, sched_loss,
                                 lr_scheduler_mode, optimizer, stop_lr)
             elif not in_stage2:
-                _scheduler_step(lr_scheduler, avg_loss,
+                _scheduler_step(lr_scheduler, sched_loss,
                                 lr_scheduler_mode, optimizer, stop_lr)
 
-            loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.6f} "
-                           f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}\n")
+            # Early stopping on the monitored metric. Improvement uses the same
+            # 1e-4 relative threshold as ReduceLROnPlateau, so "no improvement"
+            # means the same thing to both. The counter resets when stage 2
+            # begins (the loss scale shifts with the stage-2 weights). In DDP
+            # every rank sees the identical (all-reduced) sched_loss, so all
+            # ranks reach the same decision and stop together.
+            #
+            # Early stop is per-STAGE (MACE-style): if stage 1 plateaus while
+            # a stage 2 is configured but not yet started, the run jumps into
+            # stage 2 at the next epoch instead of terminating — only a
+            # plateau in the final stage ends the run. The advanced
+            # start_stage2 is saved in the checkpoint so a resumed run stays
+            # in stage 2 (nep.in's start_stage2 would say otherwise).
+            stop_now = False
+            if early_stop:
+                if in_stage2 and not prev_in_stage2:
+                    es_best = float("inf")
+                    es_wait = 0
+                if sched_loss < es_best * (1.0 - 1e-4):
+                    es_best = sched_loss
+                    es_wait = 0
+                else:
+                    es_wait += 1
+                    if es_wait >= early_stop:
+                        if stage2 and not in_stage2:
+                            _log(f"Early stop (stage 1): {monitored} did "
+                                 f"not improve for {early_stop} epochs — "
+                                 f"starting stage 2 at epoch {epoch + 1} "
+                                 f"(was scheduled for epoch {start_stage2}).")
+                            start_stage2 = epoch + 1
+                            es_best = float("inf")
+                            es_wait = 0
+                        else:
+                            stop_now = True
+            prev_in_stage2 = in_stage2
+
+            row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
+                   f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}")
+            if valid_loss is not None:
+                row += (f" {v_rmse_e:.6f} {v_rmse_f:.6f} {v_rmse_v:.6f} "
+                        f"{v_rmse_s:.4f}")
+            loss_log.write(row + "\n")
             loss_log.flush()
 
             stage_str = "[S2] " if in_stage2 else ""
             cur_lr = optimizer.param_groups[0]['lr']
             v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
                      if has_virial else "")
-            line = (f"{stage_str}Epoch {epoch:4d} | loss {avg_loss:.4e} | "
+            valid_str = ""
+            if valid_loss is not None:
+                valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
+                             + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
+                                if has_virial else ""))
+            line = (f"{stage_str}Epoch {epoch:4d} | loss {sched_loss:.4e} | "
                     f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
-                    f"{v_str} | gnorm {max_gn:.1f} | "
+                    f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
             if epoch % print_interval == 0 or epoch == 1:
                 _log(line)
@@ -1701,8 +2814,15 @@ def train_nep(
                 _out_log_file.write(line + "\n")
                 _out_log_file.flush()
 
-            # Best-model bookkeeping. avg_loss averages over weights that
-            # keep moving within the epoch, so it is a noisy proxy for the
+            # Best-model bookkeeping.
+            # With a validation set, nep_best is simply the epoch with the
+            # lowest validation loss — valid_loss is already a frozen-weight
+            # true evaluation (computed every epoch), so the noisy-proxy /
+            # true-eval two-step below is unnecessary. best_loss still tracks
+            # the train loss for the log / checkpoint.
+            #
+            # Without validation: avg_loss averages over weights that keep
+            # moving within the epoch, so it is a noisy proxy for the
             # end-of-epoch weights actually saved. Early in the run that is
             # fine (the model improves much faster than the noise). In the
             # last third — where best really gets decided — a new avg_loss
@@ -1711,25 +2831,17 @@ def train_nep(
             # averaging as the screen numbers) beats the best true loss so
             # far. The final epoch is always evaluated, so nep_best can
             # never end up worse than nep_final.
-            #
-            # `will_early_stop` is decided from the PREVIOUS epoch's streak
-            # (epochs_since_best_true_loss, updated below) -- once patience
-            # is exhausted, THIS epoch gets full "final epoch" treatment
-            # (forced true-loss eval, so nep_final's b1 solve matches nep_best's
-            # comparison the same way it does for epoch == num_epochs) and is
-            # the last one run.
-            will_early_stop = (
-                early_stop_patience is not None
-                and epoch >= true_eval_start
-                and epochs_since_best_true_loss >= early_stop_patience
-            )
             new_min = avg_loss < best_loss
             if new_min:
                 best_loss = avg_loss
-            if epoch < true_eval_start:
+            if valid_store is not None:
+                if valid_loss < best_valid_loss:
+                    best_valid_loss = valid_loss
+                    _save_best()
+            elif epoch < true_eval_start:
                 if new_min:
                     _save_best()
-            elif new_min or epoch == num_epochs or will_early_stop:
+            elif new_min or epoch == num_epochs or stop_now:
                 t_loss, _te, _tf, _tv = _evaluate_true_loss(
                     data_store, batch_size, raw_model,
                     compute_props, compute_props_cached,
@@ -1738,20 +2850,18 @@ def train_nep(
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
                     _save_best()
-                    epochs_since_best_true_loss = 0
-                elif epoch >= true_eval_start:
-                    epochs_since_best_true_loss += 1
-            elif epoch >= true_eval_start:
-                epochs_since_best_true_loss += 1
 
-            if epoch % checkpoint_interval == 0 or epoch == num_epochs or will_early_stop:
+            if epoch % checkpoint_interval == 0 or epoch == num_epochs or stop_now:
                 _save_checkpoint(
                     ckpt_path, model, optimizer,
                     stage2_scheduler if in_stage2 else lr_scheduler,
                     epoch, best_loss, loss_weights=cur_loss_weights,
                     in_stage2=in_stage2,
                     swa_model=swa_model if in_stage2 else None,
-                    best_true_loss=best_true_loss)
+                    best_true_loss=best_true_loss, run_seed=run_seed,
+                    best_valid_loss=best_valid_loss,
+                    valid_info=cur_valid_info,
+                    start_stage2=start_stage2)
 
             # Interim predict — overwrites the same output files, so users can
             # refresh the parity plot live. Runs on the CURRENT-epoch weights
@@ -1760,23 +2870,37 @@ def train_nep(
             # epoch's displayed loss (current weights = end-of-epoch, whereas
             # the screen average covers weights that were still improving
             # throughout the epoch).
-            # Skip on the final epoch (or an early-stopping one) — the
-            # end-of-training predict (below) immediately overwrites these
-            # files with the final-epoch result.
+            # Skip on the final epoch — the end-of-training predict (below)
+            # immediately overwrites these files with the final-epoch result.
             if (prediction_interval > 0
                     and epoch % prediction_interval == 0
-                    and epoch != num_epochs
-                    and not will_early_stop):
+                    and epoch != num_epochs):
                 # Silent interim predict — reuses data_store's preprocessed
                 # neighbor lists + basis (no xyz re-read, no recompute).
                 predict_from_store(raw_model, data_store, output_dir,
-                                   batch_size=batch_size, backend=backend,
-                                   verbose=False)
+                                   batch_size=batch_size, verbose=False)
+                if valid_store is not None:
+                    predict_from_store(raw_model, valid_store, output_dir,
+                                       batch_size=batch_size,
+                                       verbose=False, suffix="test")
 
-            if will_early_stop:
-                _log(f"Early stopping at epoch {epoch}: no true-loss "
-                     f"improvement for {early_stop_patience} epochs "
-                     f"(best_true_loss={best_true_loss:.4e}).")
+            if _PROF:
+                if dev.type == "cuda":
+                    torch.cuda.synchronize()
+                    _pa = torch.cuda.max_memory_allocated() / 2**30
+                    _pr = torch.cuda.max_memory_reserved() / 2**30
+                else:
+                    _pa = _pr = 0.0
+                _t_tail = (time.perf_counter() - _t_v0) - _t_valid
+                _log(f"  [prof] train {_t_train_wall:6.2f}s "
+                     f"(data-wait {_tp[0]:6.2f} step-cpu {_tp[1]:6.2f}) | "
+                     f"valid {_t_valid:5.2f}s tail {_t_tail:5.2f}s | "
+                     f"peak alloc {_pa:.2f} res {_pr:.2f} GiB")
+
+            if stop_now:
+                _log(f"Early stop: {monitored} did not improve for "
+                     f"{early_stop} epochs (stopped at epoch {epoch}/"
+                     f"{num_epochs}).")
                 break
     finally:
         if loss_log is not None:
@@ -1791,6 +2915,10 @@ def train_nep(
     raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
                            max_NN_rad, max_NN_ang)
     # SWA-averaged model (only when user opted in and stage 2 ran).
+    if swa_model is not None and int(swa_model.n_averaged) == 0:
+        _log("SWA window never reached (run ended before swa_start) — "
+             "nep_average.txt not written")
+        swa_model = None
     if swa_model is not None:
         swa_state = swa_model.module.state_dict()
         # Keep a copy of the final-epoch weights so we can restore them
@@ -1798,15 +2926,26 @@ def train_nep(
         # final weights, not SWA-averaged ones.
         final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
         raw_model.load_state_dict(swa_state)
+        # b1 is solved analytically each epoch (not gradient-trained), so
+        # its trajectory average is NOT the optimal offset for the averaged
+        # weights — on a 16-element benchmark the stale offset cost the SWA
+        # model ~10 meV/atom of pure energy-shift error. Re-solve it for
+        # the averaged weights before saving.
+        recompute_b1_shift(raw_model, data_store, batch_size, backend)
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                max_NN_rad, max_NN_ang)
         raw_model.load_state_dict(final_state)
-        _log("SWA model saved to nep_average.txt")
+        _log("SWA model saved to nep_average.txt (b1 re-solved for the "
+             "averaged weights)")
 
     train_time = time.time() - train_t0
     h, rem = divmod(train_time, 3600)
     m_, s = divmod(rem, 60)
-    _log(f"\nDone. Best loss: {best_loss:.6e}")
+    if valid_store is not None:
+        _log(f"\nDone. Best validation loss (nep_best): "
+             f"{best_valid_loss:.6e}")
+    else:
+        _log(f"\nDone. Best loss: {best_loss:.6e}")
     _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
     # End-of-training predict reuses the in-memory data_store (no xyz re-read)
@@ -1814,8 +2953,11 @@ def train_nep(
     _log("\nRunning prediction on training set (final-epoch model)...")
     pred_t0 = time.time()
     predict_from_store(raw_model, data_store, output_dir,
-                       batch_size=batch_size, backend=backend,
-                       verbose=False)
+                       batch_size=batch_size, verbose=False)
+    if valid_store is not None:
+        predict_from_store(raw_model, valid_store, output_dir,
+                           batch_size=batch_size,
+                           verbose=False, suffix="test")
     _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
     total_time = time.time() - total_t0

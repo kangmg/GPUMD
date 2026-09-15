@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """Tests for the analytical b1 energy shift and the ``use_gpumd_qscaler``
 training option (branch ``qscaler-optimizer-test``).
@@ -25,22 +25,22 @@ import numpy as np
 import torch
 
 from torchnep.data import read_xyz, parse_nep_in
-from torchnep.train import (preprocess_structures, GPUDataStore,
+from torchnep.train import (preprocess_structures, StreamDataStore,
                             compute_q_scaler, recompute_b1_shift, train_nep)
-from torchnep.model import NEPModel
+from torchnep.model import NEPModel, gpumd_init_parameters
 from _common import DATA_DIR
 
-# PbTe example carries per-frame energy + forces (the CrCoNi fixture has no
+# CrCoNi_train.xyz carries per-frame energy + forces + virial (CrCoNi.xyz has no
 # energy labels, so it can't exercise the energy-offset b1 logic).
-PBTE = DATA_DIR.parent.parent / "example" / "PbTe" / "train.xyz"
-NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+XYZ = DATA_DIR / "CrCoNi_train.xyz"
+NEP_IN = ("type 3 Cr Co Ni\ncutoff 6 4\nn_max 4 4\n"
           "basis_size 6 6\nl_max 4 2 1\nneuron 30\n")
 
 
 def _store(cfg, n=20, dtype=torch.float64):
-    frames = read_xyz(str(PBTE))[:n]
+    frames = read_xyz(str(XYZ))[:n]
     structs = preprocess_structures(frames, cfg, np.float64)
-    return GPUDataStore(structs, torch.device("cpu"), dtype, config=cfg)
+    return StreamDataStore(structs, torch.device("cpu"), dtype, config=cfg)
 
 
 def _cfg_from_nepin(tmp_path=None):
@@ -118,12 +118,70 @@ def test_gpumd_init_qscaler_matches_c1_and_differs_from_self():
     assert not torch.allclose(g_max - g_min, s_max - s_min)
 
 
+def test_gpumd_init_parameters_reinits_nn_and_coeffs():
+    """gpumd_init_parameters draws every parameter — descriptor coeffs AND the
+    NN weights (w0/b0/w1) — from uniform(-1, 1), a much larger amplitude than
+    torch's default small-variance NN init."""
+    torch.manual_seed(3)
+    cfg = _cfg_from_nepin()
+    m = NEPModel(cfg).to(torch.float64)
+
+    # torch's default init is small; b0 starts at exactly zero.
+    assert m.fitting_nets[0].w0.abs().max().item() < 0.5
+    assert torch.count_nonzero(m.fitting_nets[0].b0) == 0
+
+    gpumd_init_parameters(m)
+
+    for net in m.fitting_nets:
+        for name, p in (("w0", net.w0), ("b0", net.b0), ("w1", net.w1)):
+            assert p.min().item() >= -1.0 and p.max().item() <= 1.0, name
+        # uniform(-1,1) reaches near the edges — far wider than the small init.
+        assert net.w0.abs().max().item() > 0.5
+        assert net.b0.abs().max().item() > 0.0     # no longer all-zero
+    assert m.c_param_2.min().item() >= -1.0 and m.c_param_2.max().item() <= 1.0
+
+
+def _weight_rms(cfg, nep_txt):
+    m = NEPModel(cfg).to(torch.float64)
+    m.load_weights_from_nep_txt(nep_txt)
+    sq, n = 0.0, 0
+    for net in m.fitting_nets:
+        for p in (net.w0, net.b0, net.w1):
+            sq += float((p.detach() ** 2).sum()); n += p.numel()
+    return (sq / n) ** 0.5
+
+
+def test_weight_decay_shrinks_weights(tmp_path):
+    """With the same seed/init/data order, a positive weight_decay (AdamW
+    decoupled decay) drives the NN weights to a smaller RMS than an
+    unregularized run — the only difference is the decay term, which points
+    every weight toward 0. (lambda_1/lambda_2 were removed; nep.in files
+    that still carry them get a warning and the keys are ignored.)"""
+    _, xyz = _write_run_files(tmp_path)
+    base = tmp_path / "nep0.in"
+    base.write_text(NEP_IN + "epoch 15\nbatch 8\nlambda_2 0\n")
+    reg = tmp_path / "nepR.in"
+    reg.write_text(NEP_IN + "epoch 15\nbatch 8\nweight_decay 0.3\n")
+
+    kw = dict(data_file=xyz, device="cpu", precision="float64",
+              print_interval=100, restart=False, checkpoint_interval=10000,
+              prediction_interval=10000, run_seed=7)
+    train_nep(config_file=str(base), output_dir=str(tmp_path / "o0"), **kw)
+    train_nep(config_file=str(reg), output_dir=str(tmp_path / "oR"), **kw)
+
+    cfg = parse_nep_in(str(base))
+    rms0 = _weight_rms(cfg, str(tmp_path / "o0" / "nep_final.txt"))
+    rmsR = _weight_rms(cfg, str(tmp_path / "oR" / "nep_final.txt"))
+    assert rmsR < rms0, (
+        f"weight_decay did not shrink weights: reg={rmsR} vs none={rms0}")
+
+
 def _write_run_files(tmp_path, n_frames=20):
     nepin = tmp_path / "nep.in"
     nepin.write_text(NEP_IN + "epoch 3\nbatch 8\n")
     xyz = tmp_path / "train.xyz"
-    # Slice PbTe down to n_frames by re-reading the raw text blocks.
-    raw = PBTE.read_text().splitlines()
+    # Slice the fixture down to n_frames by re-reading the raw text blocks.
+    raw = XYZ.read_text().splitlines()
     out, i, k = [], 0, 0
     while i < len(raw) and k < n_frames:
         na = int(raw[i].strip())
@@ -151,10 +209,16 @@ def test_train_nep_b1_not_in_optimizer_and_analytic(tmp_path):
 
 
 def test_nep_best_not_worse_than_final(tmp_path):
-    """nep_best's energy fit must not be worse than nep_final's.
+    """nep_best's TRUE weighted loss must not be worse than nep_final's.
 
-    Both are saved with their own exact analytical b1 and the final epoch is
-    always a best candidate, so nep_best can never end up worse than nep_final.
+    What training guarantees (best-save block in train_nep): without a
+    validation set, a candidate becomes nep_best only if its frozen-weight
+    full-dataset loss ``lambda_e*MSE_E + lambda_f*MSE_F + lambda_v*MSE_V``
+    (with its own exact b1) beats the best so far, and the final epoch is
+    always a candidate — so nep_best <= nep_final in that weighted loss.
+    The energy MSE alone is NOT guaranteed (a later epoch can trade a little
+    energy for a larger force gain), which is what made the old energy-only
+    assertion flaky. The seed is fixed so the run is reproducible.
     """
     _, xyz = _write_run_files(tmp_path)
     (tmp_path / "nep.in").write_text(NEP_IN + "epoch 12\nbatch 8\n")
@@ -162,24 +226,26 @@ def test_nep_best_not_worse_than_final(tmp_path):
     train_nep(config_file=str(tmp_path / "nep.in"), data_file=xyz,
               output_dir=str(out), device="cpu", precision="float64",
               print_interval=100, restart=False, checkpoint_interval=10000,
-              prediction_interval=10000)
+              prediction_interval=10000, run_seed=11)
 
     cfg = parse_nep_in(str(tmp_path / "nep.in"))
     ds = _store(cfg)
+    # the loss weights in force at the end of the run (stage 2 if configured)
+    if cfg.get("stage2"):
+        pref = (cfg["stage2_pref_e"], cfg["stage2_pref_f"], cfg["stage2_pref_v"])
+    else:
+        pref = (cfg["lambda_e"], cfg["lambda_f"], cfg["lambda_v"])
 
-    def energy_mse(path):
+    def true_loss(path):
+        from torchnep.train import _evaluate_true_loss
         m = NEPModel(cfg).to(torch.float64)
         m.load_weights_from_nep_txt(path)
-        sq, n = 0.0, 0
-        with torch.no_grad():
-            for s in range(0, ds.n, 1000):
-                b = ds.collate(list(range(s, min(s + 1000, ds.n))))
-                r = m.compute_properties_cached(b, need_forces=False, backend="loop")
-                d = (r["Etot"] / b["natoms"] - b["energy"] / b["natoms"])[b["energy_mask"]]
-                sq += float((d ** 2).sum()); n += int(b["energy_mask"].sum())
-        return sq / max(n, 1)
+        loss, _, _, _ = _evaluate_true_loss(
+            ds, 1000, m, m.compute_properties, m.compute_properties_cached,
+            False, "loop", *pref, torch.float64, torch.device("cpu"))
+        return float(loss)
 
-    assert energy_mse(str(out / "nep_best.txt")) <= energy_mse(str(out / "nep_final.txt")) + 1e-9
+    assert true_loss(str(out / "nep_best.txt")) <= true_loss(str(out / "nep_final.txt")) + 1e-9
 
 
 def test_train_nep_use_gpumd_qscaler(tmp_path):
@@ -214,3 +280,28 @@ def test_train_nep_use_gpumd_qscaler(tmp_path):
 
     assert torch.allclose(mg.q_scaler, qs_c1, rtol=1e-5, atol=1e-8)
     assert not torch.allclose(mg.q_scaler, ms.q_scaler)
+
+
+def test_swa_model_b1_is_optimal(tmp_path):
+    """nep_average.txt must carry a b1 re-solved for the AVERAGED weights:
+    the mean per-atom energy residual of the saved SWA model over the
+    training set is ~0 (b1's per-epoch analytic values averaged along the
+    trajectory are a stale offset otherwise)."""
+    nepin, xyz = _write_run_files(tmp_path)
+    with open(nepin, "a") as f:
+        f.write("stage2 1\nstart_stage2 2\nepoch 6\n")
+    out = tmp_path / "out_swa"
+    train_nep(config_file=nepin, data_file=xyz, output_dir=str(out),
+              device="cpu", precision="float64", print_interval=100,
+              restart=False, checkpoint_interval=1000,
+              prediction_interval=1000, run_seed=3, use_swa=True)
+    assert (out / "nep_average.txt").exists()
+
+    cfg = parse_nep_in(nepin)
+    ds = _store(cfg)
+    m = NEPModel(cfg).to(torch.float64)
+    m.load_weights_from_nep_txt(str(out / "nep_average.txt"))
+    b1_before = float(m.b1.item())
+    recompute_b1_shift(m, ds, batch_size=8, backend="loop")
+    # If the saved b1 was already optimal, re-solving changes it by ~0.
+    assert abs(float(m.b1.item()) - b1_before) < 1e-8
