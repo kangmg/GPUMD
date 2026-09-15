@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 Trainable NEP4 model as a PyTorch nn.Module.
@@ -26,9 +26,10 @@ import numpy as np
 from typing import List
 
 from .constants import (
-    ELEMENTS, C3B, C4B, C5B, C4B2, COVALENT_RADIUS,
+    ELEMENTS, C3B, C4B, C5B, C4B2, COVALENT_RADIUS, ZBL_PARA,
 )
 from . import ops
+from .data import zbl_pair_index, cutoff_pair_table
 
 
 class FittingNet(nn.Module):
@@ -66,8 +67,27 @@ class NEPModel(nn.Module):
         super().__init__()
         self.num_types = config["num_types"]
         self.type_names = config["type_names"]
+        # Cutoffs: rc_radial / rc_angular are the LARGEST values (neighbor
+        # search radius, tracing ranges); with per-species cutoffs (GPUMD
+        # "cutoff rR1 rA1 rR2 rA2 ...") the (T, T) pair tables below carry
+        # the value each element pair actually uses, 0.5 * (rc[t1] + rc[t2]).
         self.rc_radial = config["cutoff_radial"]
         self.rc_angular = config["cutoff_angular"]
+        self.rc_radial_per_type = config.get("cutoff_radial_per_type")
+        self.rc_angular_per_type = config.get("cutoff_angular_per_type")
+        if self.rc_radial_per_type is not None:
+            self.rc_radial_per_type = [float(x) for x in self.rc_radial_per_type]
+            self.rc_angular_per_type = [float(x) for x in self.rc_angular_per_type]
+            if len(self.rc_radial_per_type) != self.num_types:
+                raise ValueError(f"cutoff_radial_per_type has "
+                                 f"{len(self.rc_radial_per_type)} values for "
+                                 f"{self.num_types} types")
+            self.rc_radial = max(self.rc_radial_per_type)
+            self.rc_angular = max(self.rc_angular_per_type)
+            self.register_buffer("rc_radial_pair", torch.tensor(
+                cutoff_pair_table(self.rc_radial_per_type)), persistent=False)
+            self.register_buffer("rc_angular_pair", torch.tensor(
+                cutoff_pair_table(self.rc_angular_per_type)), persistent=False)
         self.n_max_radial = config["n_max_radial"]
         self.n_max_angular = config["n_max_angular"]
         self.basis_size_radial = config["basis_size_radial"]
@@ -99,13 +119,23 @@ class NEPModel(nn.Module):
 
         # ZBL
         self.zbl = config.get("zbl", None)
+        # Flexible ZBL (GPUMD zbl.in): per-element-pair cutoffs + screening
+        # coefficients, (n_pairs, 10) table; None = universal ZBL.
+        self.zbl_flexible = None
         if self.zbl is not None:
             # Real atomic numbers (H=1). ZBL needs physical Z in Z*Z', Z^0.23.
             atomic_numbers = [ELEMENTS.index(n) + 1 for n in self.type_names]
             self.register_buffer("atomic_numbers",
                                  torch.tensor(atomic_numbers, dtype=torch.long))
             tw = config.get("typewise_cutoff_zbl_factor", None)
-            if tw is not None:
+            if config.get("zbl_flexible") is not None:
+                if tw is not None:
+                    warnings.warn("use_typewise_cutoff_zbl is ignored when "
+                                  "zbl points to a zbl.in file (the per-pair "
+                                  "cutoffs of the file are used)", stacklevel=2)
+                tw = None            # GPUMD: flexible parameters win
+                self.set_flexible_zbl(config["zbl_flexible"])
+            elif tw is not None:
                 # COVALENT_RADIUS is 0-indexed, atomic_numbers is real Z -> z-1.
                 rc_i = [tw * COVALENT_RADIUS[z - 1] for z in atomic_numbers]
                 self.register_buffer("zbl_rc_inner_per_type", torch.tensor(rc_i))
@@ -118,6 +148,45 @@ class NEPModel(nn.Module):
                 self.zbl_rc_inner = self.zbl / 2.0
                 self.zbl_rc_outer = self.zbl
                 self.zbl_typewise_factor = None
+
+            # (T, T) per-type-pair tables for the compiled ZBL term
+            # (ops.compute_zbl_pair): gathering from these keeps the whole
+            # ZBL evaluation branch-free and traceable. Built in float64;
+            # the module-level .to(dtype) casts them with the other buffers.
+            an_f = torch.tensor(atomic_numbers, dtype=torch.float64)
+            zi, zj = an_f.view(-1, 1), an_f.view(1, -1)
+            self.register_buffer("zbl_zizj_pair", ops.K_C_SP * zi * zj,
+                                 persistent=False)
+            self.register_buffer("zbl_a_inv_pair",
+                                 (zi ** 0.23 + zj ** 0.23) * 2.134563,
+                                 persistent=False)
+            if tw is not None:
+                # NEP_CPU typewise convention: rc_outer per pair is
+                # min((cov_i + cov_j) * factor, global rc_outer), rc_inner 0.
+                # Built FROM the registered per-type buffer (float32-rounded)
+                # so the table matches the eager compute_zbl path bit-for-bit.
+                rt = self.zbl_rc_outer_per_type.to(torch.float64)
+                rc_o_pair = torch.clamp(0.5 * (rt.view(-1, 1) + rt.view(1, -1)),
+                                        max=self.zbl_rc_outer)
+                rc_i_pair = torch.zeros_like(rc_o_pair)
+            else:
+                shape = (len(atomic_numbers), len(atomic_numbers))
+                rc_o_pair = torch.full(shape, self.zbl_rc_outer,
+                                       dtype=torch.float64)
+                rc_i_pair = torch.full(shape, self.zbl_rc_inner,
+                                       dtype=torch.float64)
+            if self.zbl_flexible is None:
+                self.register_buffer("zbl_rc_inner_pair", rc_i_pair,
+                                     persistent=False)
+                self.register_buffer("zbl_rc_outer_pair", rc_o_pair,
+                                     persistent=False)
+                # universal screening function: the same 8 constants for
+                # every pair (the flexible table replaces them per pair)
+                T = len(atomic_numbers)
+                self.register_buffer(
+                    "zbl_phi_pair",
+                    torch.tensor(ZBL_PARA, dtype=torch.float64).expand(T, T, 8).clone(),
+                    persistent=False)
 
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
@@ -160,6 +229,13 @@ class NEPModel(nn.Module):
         self.register_buffer("_c5b", torch.tensor(C5B))
         self.register_buffer("_c4b2", torch.tensor(C4B2))
 
+    def cutoff_args(self):
+        """``(rc_radial, rc_angular)`` as the basis functions take them: the
+        floats for uniform cutoffs, the (T, T) pair tables per species."""
+        if self.rc_radial_per_type is None:
+            return self.rc_radial, self.rc_angular
+        return self.rc_radial_pair, self.rc_angular_pair
+
     @torch.no_grad()
     def set_q_scaler(self, q_min: torch.Tensor, q_max: torch.Tensor):
         diff = torch.clamp(q_max - q_min, min=1e-10)
@@ -172,7 +248,7 @@ class NEPModel(nn.Module):
         return ops.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,
             atom_types, N, self.c_param_2, self.c_param_3,
-            self.rc_radial, self.rc_angular,
+            *self.cutoff_args(),
             self.basis_size_radial, self.basis_size_angular,
             self.n_max_radial, self.n_max_angular,
             self.l_max_3b,
@@ -234,7 +310,7 @@ class NEPModel(nn.Module):
                 self.zbl_typewise_factor,
                 getattr(self, "zbl_rc_inner_per_type", None),
                 getattr(self, "zbl_rc_outer_per_type", None),
-                dtype, device)
+                dtype, device, **self._flexible_zbl_kwargs())
 
         Etot = torch.zeros(num_structures, dtype=dtype, device=device)
         Etot.scatter_add_(0, struct_idx, Ei)
@@ -262,14 +338,20 @@ class NEPModel(nn.Module):
 
         return result
 
-    def compute_properties_cached(self, batch, need_forces=True, need_virial=False,
-                                   backend: str = "loop"):
-        """Compute energy, forces, virial using precomputed basis.
+    def _cached_core(self, batch, need_forces=True, need_virial=False,
+                     backend: str = "loop"):
+        """Descriptor + NN + analytical-force part of the cached compute.
 
-        Uses fully analytical force computation — no create_graph=True needed.
-        Forces are differentiable through c2, c3 (via Fp->NN weights and via s->c3).
+        Deliberately free of data-dependent Python control flow — the NN
+        dispatch is a branchless weight gather, and ZBL is the branch-free
+        table variant (``ops.compute_zbl_pair``) with analytic pair
+        gradients — so ``torch.compile`` captures this whole function as
+        ONE graph with no breaks (the eager reference path's ``mask.any()``
+        branches and inner ``autograd.grad`` each split the graph). Only
+        result assembly lives in the ``compute_properties_cached`` wrapper.
 
-        ``backend`` in {"loop", "bmm"} — see torchnep.ops.resolve_backend.
+        Returns ``(Ei, forces, virial)`` — forces/virial are None when not
+        requested.
         """
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device
@@ -314,81 +396,76 @@ class NEPModel(nn.Module):
 
         q_scaled = q * self.q_scaler
 
-        # NN forward + Fp computation (differentiable through NN weights).
+        # NN forward + Fp via per-atom GATHERED weights — one batched matmul
+        # for all atoms instead of the old per-type loop (which ran every
+        # type's net on all atoms and torch.where-selected: T x the flops
+        # and ~3T tiny GEMM launches; profiled at 118 aten::mm per training
+        # step for 16 types — the single largest GPU cost).
         #
-        # Every per-type fitting net is touched in the graph on every forward
-        # — even types with no atoms in this batch get a zeroed-out dummy pass.
-        # This keeps DDP gradient bookkeeping consistent (no need for
-        # find_unused_parameters=True) and, critically, avoids the implicit
-        # /world_size gradient dilution that DDP applies to unused parameters
-        # (which was biasing rare-type NNs toward lower effective LR).
-        Ei = torch.zeros(N, dtype=dtype, device=device)
-        Fp = torch.zeros(N, self.dim, dtype=dtype, device=device)
-        dummy_accum = torch.zeros((), dtype=dtype, device=device)
-        dummy_q = q_scaled[:1] if q_scaled.shape[0] > 0 else torch.zeros(
-            1, self.dim, dtype=dtype, device=device)
-
-        for t in range(self.num_types):
-            mask = batch["atom_types"] == t
-            net = self.fitting_nets[t]
-            if mask.any():
-                qt = q_scaled[mask]
-                z = qt @ net.w0 - net.b0
-                h = torch.tanh(z)
-                Ei[mask] = h @ net.w1
-                tanh_der = 1.0 - h * h
-                Fp[mask] = (net.w1 * tanh_der) @ net.w0.T
-            else:
-                # Dummy forward (the * 0 below nulls the contribution but
-                # keeps the net's parameters in the autograd graph).
-                z_d = dummy_q @ net.w0 - net.b0
-                h_d = torch.tanh(z_d)
-                dummy_accum = dummy_accum + (h_d @ net.w1).sum()
+        # Still branch-free (gather / one-hot matmul, fully traceable) and
+        # still DDP-safe: the weight stacks are built from EVERY type's
+        # parameters, so all parameters join the autograd graph on every
+        # forward (absent types just receive zero gradient slices).
+        # With gradients enabled the per-atom weights come from a one-hot
+        # matmul so the backward into the stacks is one clean GEMM instead
+        # of index_put atomics (same trick and thresholds as the mulsum
+        # contraction — see ops._gather_c_onehot).
+        w0s = torch.stack([n.w0 for n in self.fitting_nets])   # (T, dim, H)
+        b0s = torch.stack([n.b0 for n in self.fitting_nets])   # (T, H)
+        w1s = torch.stack([n.w1 for n in self.fitting_nets])   # (T, H)
+        T = self.num_types
+        at = batch["atom_types"]
+        need_grad = torch.is_grad_enabled() and w0s.requires_grad
+        if need_grad and (T <= 32 or torch.version.hip is not None):
+            oh = torch.nn.functional.one_hot(at, T).to(dtype)  # (N, T)
+            W0 = (oh @ w0s.reshape(T, -1)).view(N, self.dim, -1)
+            B0 = oh @ b0s
+            W1 = oh @ w1s
+        else:
+            W0 = w0s[at]
+            B0 = b0s[at]
+            W1 = w1s[at]
+        if ops.NN_MULSUM:
+            # ROCm: rocBLAS is poor on these skinny batched shapes (45% of
+            # the MI250X step went to Cijk_* GEMMs); the explicit
+            # multiply+reduce lowers to fused Triton kernels instead —
+            # measured 25% faster full step on MI250X, identical math.
+            h = torch.tanh((q_scaled.unsqueeze(-1) * W0).sum(1) - B0)
+            Ei = (h * W1).sum(-1)
+            Fp = (W0 * (W1 * (1.0 - h * h)).unsqueeze(1)).sum(-1)
+        else:
+            h = torch.tanh(torch.bmm(q_scaled.unsqueeze(1), W0).squeeze(1)
+                           - B0)
+            Ei = (h * W1).sum(-1)
+            Fp = torch.bmm(W0, (W1 * (1.0 - h * h)).unsqueeze(-1)).squeeze(-1)
 
         Fp = Fp * self.q_scaler  # absorb q_scaler into Fp
-        # Nail the unused-type gradient path into Ei without changing its value.
-        Ei = Ei + dummy_accum * 0.0
         Ei = Ei - self.b1  # subtract shared output bias
 
-        # ZBL energy + forces (no trainable params; local autograd on rij_ang).
-        # enable_grad: end-of-training predict_from_store wraps this call in
-        # torch.no_grad(), under which Ei_zbl.requires_grad would be False
-        # and the ZBL force contribution would be silently dropped.
-        zbl_forces = None
-        zbl_virial = None
+        # ZBL — branch-free table variant, fully inside the compiled graph
+        # (energy over all angular pairs; fc is exactly zero beyond the
+        # per-pair cutoff, so no boolean compaction is needed). The pair
+        # gradient g_zbl rides into compute_analytical_forces where it is
+        # folded into the angular scatter for free.
+        g_zbl = None
         if self.zbl is not None:
-            with torch.enable_grad():
-                rij_zbl = batch["rij_ang"].detach().requires_grad_(True)
-                Ei_zbl = ops.compute_zbl(
-                    batch["atom_types"], batch["pair_i_ang"], batch["pair_j_ang"],
-                    rij_zbl, N, self.atomic_numbers.tolist(),
-                    self.zbl_rc_inner, self.zbl_rc_outer, self.zbl_typewise_factor,
-                    getattr(self, "zbl_rc_inner_per_type", None),
-                    getattr(self, "zbl_rc_outer_per_type", None), dtype, device)
-                if need_forces and Ei_zbl.requires_grad:
-                    g_zbl = torch.autograd.grad(Ei_zbl.sum(), rij_zbl,
-                                                allow_unused=True)[0]
-                else:
-                    g_zbl = None
-            Ei = Ei + Ei_zbl.detach()
-            if g_zbl is not None:
-                empty_i = torch.zeros(0, dtype=torch.long, device=device)
-                empty_r = torch.zeros(0, 3, dtype=dtype, device=device)
-                zbl_forces, zbl_virial = ops.accumulate_forces_virial(
-                    N, empty_i, empty_i, empty_r, empty_r,
-                    batch["pair_i_ang"], batch["pair_j_ang"],
-                    batch["rij_ang"].detach(), g_zbl.detach(),
-                    dtype, device,
-                )
+            e_zbl, g_zbl = ops.compute_zbl_pair(
+                batch["atom_types"], batch["pair_i_ang"],
+                batch["pair_j_ang"], batch["rij_ang"],
+                self.zbl_zizj_pair, self.zbl_a_inv_pair,
+                self.zbl_rc_inner_pair, self.zbl_rc_outer_pair,
+                need_grad=need_forces,
+                # universal ZBL keeps the constant coefficients (unchanged
+                # kernel); only the flexible table adds the per-pair gather
+                phi_tab=self.zbl_phi_pair if self.zbl_flexible is not None else None)
+            Ei = Ei.scatter_add(0, batch["pair_i_ang"], e_zbl)
 
-        Etot = torch.zeros(batch["num_structures"], dtype=dtype, device=device)
-        Etot.scatter_add_(0, batch["struct_idx"], Ei)
-
-        result = {"Ei": Ei, "Etot": Etot}
-
+        forces = None
+        virial = None
         if need_forces:
-            # Analytical forces: fully differentiable through c2/c3 and NN weights (Fp).
-            # No create_graph=True needed — chain rule is computed explicitly.
+            # Analytical forces: fully differentiable through c2/c3 and NN
+            # weights (Fp). No create_graph=True needed — chain rule is
+            # computed explicitly.
             forces, virial = ops.compute_analytical_forces(
                 Fp, batch["atom_types"], N,
                 self.c_param_2, self.c_param_3,
@@ -408,15 +485,39 @@ class NEPModel(nn.Module):
                 backend=backend,
                 has_q_123=self.has_q_123, has_q_233=self.has_q_233,
             has_q_134=self.has_q_134,
+                g_extra_ang=g_zbl,
             )
-            if zbl_forces is not None:
-                forces = forces + zbl_forces
-                if need_virial:
-                    virial = virial + zbl_virial
+        return Ei, forces, virial
+
+    def compute_properties_cached(self, batch, need_forces=True, need_virial=False,
+                                   backend: str = "loop", core_fn=None):
+        """Compute energy, forces, virial using precomputed basis.
+
+        Uses fully analytical force computation — no create_graph=True needed.
+        Forces are differentiable through c2, c3 (via Fp->NN weights and via s->c3).
+
+        ``backend`` in {"loop", "bmm"} — see torchnep.ops.resolve_backend.
+        ``core_fn`` optionally substitutes a ``torch.compile``d version of
+        ``_cached_core`` (the trainer passes one); the core includes ZBL
+        (branch-free table variant), only the per-structure energy
+        reduction below stays eager.
+        """
+        dtype = self.q_scaler.dtype
+        device = self.q_scaler.device
+        N = batch["N"]
+
+        core = core_fn if core_fn is not None else self._cached_core
+        Ei, forces, virial = core(batch, need_forces=need_forces,
+                                  need_virial=need_virial, backend=backend)
+
+        Etot = torch.zeros(batch["num_structures"], dtype=dtype, device=device)
+        Etot.scatter_add_(0, batch["struct_idx"], Ei)
+
+        result = {"Ei": Ei, "Etot": Etot}
+        if need_forces:
             result["forces"] = forces
             if need_virial and virial is not None:
                 result["virial"] = virial
-
         return result
 
     def load_weights_from_nep_txt(self, path: str):
@@ -492,6 +593,64 @@ class NEPModel(nn.Module):
         # q_scaler (buffer — kept; the weights were trained against it)
         q_scaler = vals[idx:idx + dim]
         self.q_scaler.copy_(torch.from_numpy(q_scaler.copy()))
+        idx += dim
+
+        # flexible ZBL table at the end of a "zbl 0 0" file: adopt it (a
+        # fine-tune from a flexible model keeps its ZBL unless nep.in gives
+        # its own zbl.in, which was applied at construction)
+        n_pairs = nt * (nt + 1) // 2
+        file_flexible = any(ln.split()[:3] == ["zbl", "0", "0"]
+                            for ln in lines[:header_lines])
+        if file_flexible and self.zbl is not None and self.zbl_flexible is None:
+            if len(vals) < idx + 10 * n_pairs:
+                raise ValueError(f"{path}: 'zbl 0 0' header but the flexible "
+                                 f"ZBL table ({10 * n_pairs} numbers) is missing")
+            self.set_flexible_zbl(vals[idx:idx + 10 * n_pairs].reshape(n_pairs, 10))
+            self.zbl_typewise_factor = None
+
+    # ---- flexible ZBL (GPUMD zbl.in) --------------------------------------
+    def set_flexible_zbl(self, table):
+        """Install per-element-pair ZBL parameters (GPUMD ``zbl.in`` table:
+        ``n_pairs x 10`` rows ``rc_inner rc_outer a1..a8`` in the order
+        1-1, 1-2, ..., n-n). Replaces the universal / typewise cutoffs."""
+        T = self.num_types
+        tab = torch.as_tensor(np.asarray(table, dtype=np.float64)).reshape(-1, 10)
+        if tab.shape[0] != T * (T + 1) // 2:
+            raise ValueError(f"flexible ZBL table has {tab.shape[0]} rows, "
+                             f"{T} types need {T * (T + 1) // 2}")
+        rc_i = torch.zeros(T, T, dtype=torch.float64)
+        rc_o = torch.zeros(T, T, dtype=torch.float64)
+        phi = torch.zeros(T, T, 8, dtype=torch.float64)
+        for t1 in range(T):
+            for t2 in range(T):
+                row = tab[zbl_pair_index(t1, t2, T)]
+                rc_i[t1, t2], rc_o[t1, t2] = row[0], row[1]
+                phi[t1, t2] = row[2:]
+        # float64 tables at construction (the module-level .to(dtype) casts
+        # them with every other buffer); the model dtype/device once built
+        dev = self.b1.device if hasattr(self, "b1") else torch.device("cpu")
+        dt = self.b1.dtype if hasattr(self, "b1") else torch.float64
+        for name, t in (("zbl_flexible", tab), ("zbl_rc_inner_pair", rc_i),
+                        ("zbl_rc_outer_pair", rc_o), ("zbl_phi_pair", phi)):
+            t = t.to(device=dev, dtype=dt)
+            if hasattr(self, name):
+                setattr(self, name, t)
+            else:
+                self.register_buffer(name, t, persistent=(name == "zbl_flexible"))
+        for name in ("zbl_rc_inner_per_type", "zbl_rc_outer_per_type"):
+            if hasattr(self, name):
+                delattr(self, name)
+        self.zbl_typewise_factor = None
+        self.zbl_rc_inner = float(rc_i.min())
+        self.zbl_rc_outer = float(rc_o.max())
+        self.zbl = self.zbl_rc_outer
+
+    def _flexible_zbl_kwargs(self):
+        if self.zbl_flexible is None:
+            return {}
+        return dict(rc_inner_pair=self.zbl_rc_inner_pair,
+                    rc_outer_pair=self.zbl_rc_outer_pair,
+                    phi_pair=self.zbl_phi_pair)
 
     def save_nep_txt(self, path: str, max_NN_radial: int,
                      max_NN_angular: int):
@@ -521,19 +680,26 @@ class NEPModel(nn.Module):
             tw = self.zbl_typewise_factor
             rc_inner_out = self.zbl / 2.0
             rc_outer_out = self.zbl
-            if tw is not None:
+            if self.zbl_flexible is not None:
+                lines.append("zbl 0 0")     # GPUMD: flexible ZBL, table at the end
+            elif tw is not None:
                 lines.append(f"zbl {rc_inner_out} {rc_outer_out} {tw}")
             else:
                 lines.append(f"zbl {rc_inner_out} {rc_outer_out}")
 
         # Format cutoff: integer if whole number (matches GPUMD style).
-        # Always emit 4 fields — GPUMD's nep.txt parser requires both
-        # max_NN_radial and max_NN_angular on the cutoff line.
+        # GPUMD's nep.txt parser requires max_NN_radial and max_NN_angular
+        # at the end of the cutoff line; per-species cutoffs are written as
+        # "cutoff rR1 rA1 ... rRn rAn MN_R MN_A" (2 * num_types + 3 tokens).
         def _fmt(v):
             return str(int(v)) if v == int(v) else str(v)
-        lines.append(
-            f"cutoff {_fmt(self.rc_radial)} {_fmt(self.rc_angular)} "
-            f"{max_NN_radial} {max_NN_angular}")
+        if self.rc_radial_per_type is None:
+            cut = [self.rc_radial, self.rc_angular]
+        else:
+            cut = [v for pair in zip(self.rc_radial_per_type,
+                                     self.rc_angular_per_type) for v in pair]
+        lines.append("cutoff " + " ".join(_fmt(v) for v in cut)
+                     + f" {max_NN_radial} {max_NN_angular}")
         lines.append(f"n_max {self.n_max_radial} {self.n_max_angular}")
         lines.append(f"basis_size {self.basis_size_radial} "
                      f"{self.basis_size_angular}")
@@ -583,8 +749,34 @@ class NEPModel(nn.Module):
         for v in self.q_scaler.detach().cpu().numpy():
             lines.append(f"  {v:.10e}")
 
+        # flexible ZBL table (rc_inner rc_outer a1..a8 per element pair, GPUMD
+        # zbl.in order) — GPUMD / NEP_CPU / LAMMPS read it from here
+        if self.zbl_flexible is not None:
+            for v in self.zbl_flexible.detach().cpu().numpy().reshape(-1):
+                lines.append(f"  {v:.10e}")
+
         with open(path, "w") as f:
             f.write("\n".join(lines) + "\n")
+
+
+@torch.no_grad()
+def gpumd_init_parameters(model: NEPModel) -> None:
+    """Re-initialise every trainable parameter uniform(-1, 1) in place — the
+    SNES ``mu`` init GPUMD starts from (``snes.cu`` initialize_mu_and_sigma).
+
+    Both the descriptor coefficients (``c_param_2`` / ``c_param_3``) and the
+    fitting-network weights (``w0`` / ``b0`` / ``w1``) are covered, so a model
+    trained on top of GPUMD's ``c=1`` q_scaler starts from the same
+    large-amplitude landscape GPUMD's models inherit. Used for fresh training
+    only (never on a fine-tuned / loaded model, whose weights must be kept).
+    """
+    torch.nn.init.uniform_(model.c_param_2, -1.0, 1.0)
+    if model.c_param_3 is not None:
+        torch.nn.init.uniform_(model.c_param_3, -1.0, 1.0)
+    for net in model.fitting_nets:
+        torch.nn.init.uniform_(net.w0, -1.0, 1.0)
+        torch.nn.init.uniform_(net.b0, -1.0, 1.0)
+        torch.nn.init.uniform_(net.w1, -1.0, 1.0)
 
 
 def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
@@ -621,6 +813,10 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         "type_names":         list(keep_type_names),
         "cutoff_radial":      model.rc_radial,
         "cutoff_angular":     model.rc_angular,
+        "cutoff_radial_per_type": ([model.rc_radial_per_type[i] for i in keep_idx]
+                                   if model.rc_radial_per_type is not None else None),
+        "cutoff_angular_per_type": ([model.rc_angular_per_type[i] for i in keep_idx]
+                                    if model.rc_angular_per_type is not None else None),
         "n_max_radial":       model.n_max_radial,
         "n_max_angular":      model.n_max_angular,
         "basis_size_radial":  model.basis_size_radial,
@@ -634,6 +830,15 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         new_config["zbl"] = model.zbl
         if getattr(model, "zbl_typewise_factor", None) is not None:
             new_config["typewise_cutoff_zbl_factor"] = model.zbl_typewise_factor
+        if model.zbl_flexible is not None:
+            # keep the kept types' rows of the pair table, in zbl.in order
+            T_old = model.num_types
+            old = model.zbl_flexible.detach().cpu().numpy()
+            rows = []
+            for a in range(len(keep_idx)):
+                for b in range(a, len(keep_idx)):
+                    rows.append(old[zbl_pair_index(keep_idx[a], keep_idx[b], T_old)].tolist())
+            new_config["zbl_flexible"] = rows
 
     dev = model.b1.device
     dtype = model.b1.dtype

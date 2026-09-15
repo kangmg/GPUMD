@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 Data loading utilities for NEP training and prediction.
@@ -17,6 +17,7 @@ Data loading utilities for NEP training and prediction.
 Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
+import os
 import numpy as np
 from typing import Dict, List
 
@@ -122,6 +123,60 @@ def _split_frames(lines):
         blocks.append(lines[i:end])
         i = end
     return blocks
+
+
+def index_xyz(filename: str):
+    """Single streaming pass over an extended-XYZ file: frame index only.
+
+    Returns ``(offsets, natoms)`` — two int64 numpy arrays with, for every
+    frame, the byte offset of its ``natoms`` line and its atom count. No
+    frame content is parsed and no line list is kept, so the pass runs at
+    I/O speed with O(n_frames) memory — this is what makes multi-rank
+    sharded loading of very large files (tens of GB) feasible: one rank
+    indexes, the offsets are broadcast, and every rank then seek-reads only
+    its own frames (see :func:`read_xyz_at`).
+    """
+    offsets, natoms = [], []
+    with open(filename, "rb") as f:
+        pos = 0
+        line = f.readline()
+        while line:
+            stripped = line.strip()
+            if not stripped:          # tolerate stray blank lines between frames
+                pos = f.tell()
+                line = f.readline()
+                continue
+            n = int(stripped)
+            offsets.append(pos)
+            natoms.append(n)
+            for _ in range(n + 1):
+                f.readline()
+            pos = f.tell()
+            line = f.readline()
+    return (np.asarray(offsets, dtype=np.int64),
+            np.asarray(natoms, dtype=np.int64))
+
+
+def read_xyz_at(filename: str, offsets, energy_key: str = "energy"):
+    """Parse only the frames starting at the given byte offsets.
+
+    ``offsets`` come from :func:`index_xyz`; they may be in any order — the
+    file is swept in ascending-offset order (sequential-friendly for
+    parallel file systems) and the result list matches the ORDER OF
+    ``offsets`` as passed in. Only the requested frames' bytes are read.
+    """
+    offsets = np.asarray(offsets, dtype=np.int64)
+    order = np.argsort(offsets, kind="stable")
+    out = [None] * len(offsets)
+    with open(filename, "rb") as f:
+        for k in order:
+            f.seek(int(offsets[k]))
+            first = f.readline()
+            n = int(first)
+            block = [first.decode()]
+            block.extend(f.readline().decode() for _ in range(n + 1))
+            out[int(k)] = _parse_frame_block(block, energy_key=energy_key)
+    return out
 
 
 def read_xyz(filename: str, energy_key: str = "energy") -> List[Dict]:
@@ -240,6 +295,44 @@ def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dic
     return frame
 
 
+def zbl_pair_index(t1: int, t2: int, num_types: int) -> int:
+    """Row of the (t1, t2) element pair in a GPUMD zbl.in table (pairs are
+    listed 1-1, 1-2, ..., 1-n, 2-2, ..., n-n; order of t1/t2 irrelevant)."""
+    if t1 > t2:
+        t1, t2 = t2, t1
+    return t1 * num_types - (t1 * (t1 - 1)) // 2 + (t2 - t1)
+
+
+def read_zbl_in(filename: str, num_types: int) -> List[List[float]]:
+    """Read a GPUMD ``zbl.in`` (flexible ZBL) file.
+
+    One row per element pair, ``num_types * (num_types + 1) / 2`` rows in
+    the order 1-1, 1-2, ..., 1-n, 2-2, ..., n-n; each row holds
+    ``rc_inner rc_outer a1 a2 a3 a4 a5 a6 a7 a8`` with
+    ``phi(x) = a1 exp(-a2 x) + a3 exp(-a4 x) + a5 exp(-a6 x) + a7 exp(-a8 x)``.
+    Whitespace / line breaks are free (GPUMD reads the numbers as a stream).
+    Returns the table as a list of 10-element rows.
+    """
+    n_pairs = num_types * (num_types + 1) // 2
+    with open(filename) as f:
+        text = f.read()
+    vals = []
+    for line in text.splitlines():           # '#' starts a comment (rest of line)
+        for tok in line.split("#")[0].replace(",", " ").split():
+            vals.append(float(tok))
+    if len(vals) != 10 * n_pairs:
+        raise ValueError(
+            f"{filename}: expected {10 * n_pairs} numbers "
+            f"({n_pairs} element pairs x 10: rc_inner rc_outer a1..a8) for "
+            f"{num_types} types, found {len(vals)}")
+    table = [vals[10 * k:10 * (k + 1)] for k in range(n_pairs)]
+    for k, row in enumerate(table):
+        if not (0.0 <= row[0] < row[1]):
+            raise ValueError(f"{filename}: pair row {k + 1}: need "
+                             f"0 <= rc_inner < rc_outer, got {row[0]} {row[1]}")
+    return table
+
+
 def parse_nep_in(filename: str) -> Dict:
     """Parse nep.in parameter file.
 
@@ -276,12 +369,49 @@ def parse_nep_in(filename: str) -> Dict:
                         f"only implements NEP4 (set 'version 4').")
                 params["version"] = v
             elif key == "zbl":
-                params["zbl"] = float(parts[1])
+                # "zbl <cutoff>"  -> universal ZBL with that outer cutoff;
+                # "zbl <file>"    -> flexible ZBL: per-element-pair cutoffs
+                #                    and phi coefficients read from a GPUMD
+                #                    zbl.in file (path relative to nep.in).
+                try:
+                    params["zbl"] = float(parts[1])
+                except ValueError:
+                    zbl_path = parts[1]
+                    if not os.path.isabs(zbl_path):
+                        zbl_path = os.path.join(
+                            os.path.dirname(os.path.abspath(filename)), zbl_path)
+                    params["zbl_file"] = zbl_path
             elif key == "use_typewise_cutoff_zbl":
                 params["typewise_cutoff_zbl_factor"] = float(parts[1])
             elif key == "cutoff":
-                params["cutoff_radial"] = float(parts[1])
-                params["cutoff_angular"] = float(parts[2])
+                # "cutoff rR rA"                      -> one pair of cutoffs;
+                # "cutoff rR1 rA1 rR2 rA2 ... rRn rAn" -> per species (GPUMD):
+                #   the cutoff of an element pair is the mean of the two
+                #   species' values. Needs the 'type' line first.
+                vals = [float(x) for x in parts[1:]]
+                if len(vals) == 2:
+                    params["cutoff_radial"], params["cutoff_angular"] = vals
+                    params["cutoff_radial_per_type"] = None
+                    params["cutoff_angular_per_type"] = None
+                else:
+                    if "num_types" not in params:
+                        raise ValueError("nep.in: per-species 'cutoff' needs "
+                                         "the 'type' line before it")
+                    nt = params["num_types"]
+                    if len(vals) != 2 * nt:
+                        raise ValueError(
+                            f"nep.in: 'cutoff' takes 2 values or 2 per "
+                            f"species ({2 * nt} for {nt} types); got {len(vals)}")
+                    rr, ra = vals[0::2], vals[1::2]
+                    params["cutoff_radial_per_type"] = rr
+                    params["cutoff_angular_per_type"] = ra
+                    params["cutoff_radial"] = max(rr)
+                    params["cutoff_angular"] = max(ra)
+                for t in range(len(vals) // 2):
+                    if not 0.0 < vals[2 * t + 1] <= vals[2 * t]:
+                        raise ValueError(
+                            f"nep.in: cutoff pair {t + 1}: need 0 < angular "
+                            f"({vals[2 * t + 1]}) <= radial ({vals[2 * t]})")
             elif key == "n_max":
                 params["n_max_radial"] = int(parts[1])
                 params["n_max_angular"] = int(parts[2])
@@ -292,16 +422,14 @@ def parse_nep_in(filename: str) -> Dict:
                 params["l_max"] = [int(x) for x in parts[1:]]
             elif key == "neuron":
                 params["neuron"] = int(parts[1])
-            elif key == "lambda_1":
-                params["lambda_1"] = float(parts[1])
             elif key == "lambda_e":
                 params["lambda_e"] = float(parts[1])
             elif key == "lambda_f":
                 params["lambda_f"] = float(parts[1])
             elif key == "lambda_v":
                 params["lambda_v"] = float(parts[1])
-            elif key == "lambda_2":
-                params["lambda_2"] = float(parts[1])
+            elif key == "weight_decay":
+                params["weight_decay"] = float(parts[1])
             elif key == "batch":
                 params["batch_size"] = int(parts[1])
             elif key == "save_potential":
@@ -317,11 +445,9 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lr"] = float(parts[1])
             elif key == "scheduler_patience":
                 params["scheduler_patience"] = int(parts[1])
+            elif key == "early_stop":
+                params["early_stop"] = int(parts[1])
             elif key == "early_stop_patience":
-                # epochs with no true-loss improvement (post true_eval_start)
-                # before training stops early. No setdefault below -- absent
-                # means disabled, matching the pre-existing always-run-to-
-                # num_epochs behavior.
                 params["early_stop_patience"] = int(parts[1])
             elif key == "scheduler_factor":
                 params["scheduler_factor"] = float(parts[1])
@@ -353,6 +479,14 @@ def parse_nep_in(filename: str) -> Dict:
             elif key == "stage2_scheduler_factor":
                 params["stage2_scheduler_factor"] = float(parts[1])
 
+    if "zbl_file" in params:
+        if "num_types" not in params:
+            raise ValueError("nep.in: 'zbl <file>' needs the 'type' line")
+        params["zbl_flexible"] = read_zbl_in(params["zbl_file"],
+                                             params["num_types"])
+        # the largest outer cutoff stands in for the universal cutoff value
+        params["zbl"] = max(row[1] for row in params["zbl_flexible"])
+
     # Snapshot the explicit (user-set) keys before applying defaults so the
     # trainer can report which values came from nep.in vs which fell back
     # to a default.
@@ -362,6 +496,8 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("version", 4)
     params.setdefault("cutoff_radial", 8.0)
     params.setdefault("cutoff_angular", 4.0)
+    params.setdefault("cutoff_radial_per_type", None)
+    params.setdefault("cutoff_angular_per_type", None)
     params.setdefault("n_max_radial", 6)
     params.setdefault("n_max_angular", 6)
     params.setdefault("basis_size_radial", 6)
@@ -375,14 +511,14 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lr", 0.01)
     params.setdefault("stop_lr", 1e-6)
     params.setdefault("scheduler_patience", 15)
+    params.setdefault("early_stop", params.get("early_stop_patience", 0))
     params.setdefault("scheduler_factor", 0.7)
     params.setdefault("lr_scheduler", "plateau")
     params.setdefault("max_grad_norm", 10.0)
     params.setdefault("lambda_e", 0.01)
     params.setdefault("lambda_f", 1.0)
     params.setdefault("lambda_v", 0.01)
-    params.setdefault("lambda_1", 0.0)
-    params.setdefault("lambda_2", 0.0)
+    params.setdefault("weight_decay", 1e-4)
     params.setdefault("stage2", False)
 
     # Defaults for optional stage-2 parameters (only used if stage2=1).
@@ -403,50 +539,88 @@ def parse_nep_in(filename: str) -> Dict:
 # Neighbor list construction (numpy, CPU — shared by training and prediction)
 # ---------------------------------------------------------------------------
 
-def build_neighbor_list_np(positions, cell, cutoff):
-    """Build neighbor list using numpy (for preprocessing). Returns arrays.
+def cutoff_pair_table(per_type):
+    """``(T, T)`` float64 array of element-pair cutoffs from per-species values:
+    ``0.5 * (rc[t1] + rc[t2])`` (GPUMD's per-species ``cutoff`` convention)."""
+    r = np.asarray(per_type, dtype=np.float64)
+    return 0.5 * (r[:, None] + r[None, :])
 
-    Cell is stored with lattice vectors as ROWS. The perpendicular distance
-    between planes spanned by (b,c), (a,c), (a,b) is V/|b*c|, V/|a*c|,
-    V/|a*b|; these are ``1/|inv_cell[:,i]|`` (columns of inv_cell are the
-    reciprocal vectors). Using rows silently undercounts image replicas for
-    heavily skewed triclinic cells and drops real neighbors — bug fixed 2025.
 
-    Input positions may lie outside the primary cell. Under full PBC, physics
-    is translation-invariant, so we wrap fractional coordinates into [0, 1)
-    before computing ``n_rep``; otherwise atoms far outside the box would
-    miss periodic images that the (inside-box) ``n_rep`` estimate doesn't
-    cover.
+def pair_cutoff_np(rc, atom_types, pair_i, pair_j):
+    """Numpy twin of :func:`torchnep.ops.pair_cutoff`: ``rc`` is a float (returned
+    as is) or a ``(T, T)`` table gathered to one cutoff per pair."""
+    if np.ndim(rc) == 0:
+        return float(rc)
+    return np.asarray(rc)[atom_types[pair_i], atom_types[pair_j]]
+
+
+def wrap_positions(positions, cell):
+    """Wrap ``positions`` into the primary cell (fractional coords in [0, 1)).
+
+    Under full PBC the physics is translation-invariant, so every neighbor
+    builder works on wrapped coordinates; the wrapped array is also what the
+    compact / on-the-fly data stores keep, so their displacement vectors
+    are computed from exactly the coordinates the numpy builder used.
     """
-    N = positions.shape[0]
     inv_cell = np.linalg.inv(cell)
-
     frac = positions @ inv_cell
     frac -= np.floor(frac)
-    positions = frac @ cell
+    return frac @ cell, inv_cell
 
-    n_rep = [int(np.ceil(cutoff * np.linalg.norm(inv_cell[:, i]))) for i in range(3)]
+
+def image_repeats(inv_cell, cutoff):
+    """Periodic image repeats per lattice direction needed to cover ``cutoff``.
+
+    The perpendicular distance between planes spanned by (b,c), (a,c), (a,b)
+    is ``1/|inv_cell[:, i]|`` (columns of inv_cell are the reciprocal
+    vectors). Using the cell ROWS instead silently undercounts image replicas
+    for heavily skewed triclinic cells and drops real neighbors — bug fixed
+    2025.
+    """
+    return [int(np.ceil(cutoff * np.linalg.norm(inv_cell[:, i])))
+            for i in range(3)]
+
+
+def build_neighbor_list_np_ex(positions, cell, cutoff):
+    """Numpy neighbor list that also reports the periodic image of each pair.
+
+    Returns ``(idx_i, idx_j, rij, shift_frac, positions_wrapped)``:
+    ``shift_frac`` is the (P, 3) integer lattice translation of the neighbor
+    image (``rij = pos_w[j] + shift_frac @ cell - pos_w[i]``), so a pair list
+    can be stored without its displacement vectors (7 bytes per pair instead
+    of 28) and ``rij`` recomputed on the device from the wrapped positions.
+    :func:`build_neighbor_list_np` is this function minus the extras and is
+    numerically identical to it (same arithmetic, same pair order).
+
+    Cell is stored with lattice vectors as ROWS. Input positions may lie
+    outside the primary cell; they are wrapped first (see
+    :func:`wrap_positions`) so the image estimate covers every neighbor.
+    """
+    N = positions.shape[0]
+    positions, inv_cell = wrap_positions(positions, cell)
+    n_rep = image_repeats(inv_cell, cutoff)
 
     a_r = np.arange(-n_rep[0], n_rep[0] + 1)
     b_r = np.arange(-n_rep[1], n_rep[1] + 1)
     c_r = np.arange(-n_rep[2], n_rep[2] + 1)
-    shifts_frac = np.stack(np.meshgrid(a_r, b_r, c_r, indexing="ij"), axis=-1)
-    shifts_frac = shifts_frac.reshape(-1, 3).astype(positions.dtype)
+    shifts_int = np.stack(np.meshgrid(a_r, b_r, c_r, indexing="ij"),
+                          axis=-1).reshape(-1, 3)
+    shifts_frac = shifts_int.astype(positions.dtype)
     shifts_cart = shifts_frac @ cell
     S = shifts_cart.shape[0]
+    zero_shift = np.all(shifts_int == 0, axis=1)
 
     if N * N * S < 8_000_000:
         disp = (positions[None, :, None, :] + shifts_cart[None, None, :, :]
                 - positions[:, None, None, :])
         dist = np.linalg.norm(disp, axis=-1)
-        zero_shift = np.all(shifts_frac == 0, axis=1)
         self_mask = np.eye(N, dtype=bool)[:, :, None] & zero_shift[None, None, :]
         valid = (dist < cutoff) & (dist > 1e-10) & ~self_mask
         idx_i, idx_j, idx_s = np.where(valid)
-        return idx_i.astype(np.int64), idx_j.astype(np.int64), disp[idx_i, idx_j, idx_s]
+        return (idx_i.astype(np.int64), idx_j.astype(np.int64),
+                disp[idx_i, idx_j, idx_s], shifts_int[idx_s], positions)
 
-    zero_shift = np.all(shifts_frac == 0, axis=1)
-    all_i, all_j, all_rij = [], [], []
+    all_i, all_j, all_s, all_rij = [], [], [], []
     for si in range(S):
         shifted = positions + shifts_cart[si]
         disp = shifted[None, :, :] - positions[:, None, :]
@@ -458,10 +632,182 @@ def build_neighbor_list_np(positions, cell, cutoff):
         if len(ii) > 0:
             all_i.append(ii)
             all_j.append(jj)
+            all_s.append(np.full(len(ii), si, dtype=np.int64))
             all_rij.append(disp[ii, jj])
     if not all_i:
         return (np.zeros(0, np.int64), np.zeros(0, np.int64),
-                np.zeros((0, 3), positions.dtype))
+                np.zeros((0, 3), positions.dtype),
+                np.zeros((0, 3), np.int64), positions)
     return (np.concatenate(all_i).astype(np.int64),
             np.concatenate(all_j).astype(np.int64),
-            np.concatenate(all_rij))
+            np.concatenate(all_rij),
+            shifts_int[np.concatenate(all_s)], positions)
+
+
+def build_neighbor_list_np(positions, cell, cutoff):
+    """Build neighbor list using numpy (for preprocessing). Returns
+    ``(idx_i, idx_j, rij)`` — see :func:`build_neighbor_list_np_ex`."""
+    idx_i, idx_j, rij, _, _ = build_neighbor_list_np_ex(positions, cell, cutoff)
+    return idx_i, idx_j, rij
+
+
+def valid_split_indices(n_frames: int, valid_ratio: float, run_seed: int):
+    """Train/validation split indices — the exact split ``train_nep`` makes.
+
+    ``train_nep(valid_ratio=r, run_seed=s)`` holds out
+    ``max(1, round(r * n))`` frames drawn from a dedicated torch generator
+    seeded with ``run_seed``. This helper is that draw, factored out so the
+    trainers and :func:`export_valid_split` can never disagree.
+
+    Returns ``(train_idx, valid_idx)`` — both sorted in input-file order.
+    """
+    import torch
+    if run_seed is None:
+        raise ValueError("run_seed is required: the split is drawn from it "
+                         "(train_nep uses the same seed to reproduce it)")
+    if not 0.0 < valid_ratio < 1.0:
+        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    g = torch.Generator()
+    g.manual_seed(run_seed)
+    perm = torch.randperm(n_frames, generator=g).tolist()
+    n_val = max(1, int(round(valid_ratio * n_frames)))
+    if n_val >= n_frames:
+        raise ValueError(f"valid_ratio={valid_ratio} leaves no training "
+                         f"frames ({n_frames} total)")
+    val_set = set(perm[:n_val])
+    train_idx = [i for i in range(n_frames) if i not in val_set]
+    return train_idx, sorted(val_set)
+
+
+def export_valid_split(data_file: str, valid_ratio: float, run_seed: int,
+                       output_dir: str = "split", strategy: str = "stratified",
+                       min_stratum: int = 20):
+    """Write GPUMD-ready ``train.xyz`` / ``test.xyz`` with train_nep's split.
+
+    Reproduces exactly the validation split that
+    ``train_nep(data_file, valid_ratio=r, run_seed=s, valid_strategy=...)``
+    uses internally, so the exported pair can train the SAME data partition
+    in GPUMD (or any other code) and loss curves stay comparable. Frames
+    are copied verbatim (raw text, untouched fields and precision), in
+    input-file order.
+
+    ``strategy``: "random" (default) or "stratified" — see
+    :func:`stratified_split_indices`.
+
+    Returns ``(train_path, test_path, n_train, n_valid)``.
+    """
+    import os
+    with open(data_file) as f:
+        blocks = _split_frames(f.readlines())
+    if strategy == "stratified":
+        metas = []
+        for b in blocks:
+            na = int(b[0].split()[0])
+            metas.append((na, {line.split()[0] for line in b[2:2 + na]}))
+        train_idx, val_idx, _ = stratified_split_indices(
+            metas, valid_ratio, run_seed, min_stratum=min_stratum)
+    elif strategy == "random":
+        train_idx, val_idx = valid_split_indices(len(blocks), valid_ratio,
+                                                 run_seed)
+    else:
+        raise ValueError(f"unknown split strategy: {strategy!r}")
+    os.makedirs(output_dir, exist_ok=True)
+    train_path = os.path.join(output_dir, "train.xyz")
+    test_path = os.path.join(output_dir, "test.xyz")
+    src = os.path.abspath(data_file)
+    for path, idxs in ((train_path, train_idx), (test_path, val_idx)):
+        if os.path.abspath(path) == src:
+            raise ValueError(f"output would overwrite the input: {src}")
+        with open(path, "w") as out:
+            for k in idxs:
+                out.writelines(blocks[k])
+    return train_path, test_path, len(train_idx), len(val_idx)
+
+
+def _size_class(natoms: int) -> int:
+    """Size class for stratified splitting: 0 = tiny cells (<=4 atoms,
+    dimers/trimers — the pair-specific short-range information), 1 = small
+    (5-15), 2 = bulk (>=16)."""
+    if natoms <= 4:
+        return 0
+    if natoms <= 15:
+        return 1
+    return 2
+
+
+def stratified_split_indices(metas, valid_ratio: float, run_seed: int,
+                             min_stratum: int = 20,
+                             tiny_to_train: bool = True):
+    """Coverage-aware train/validation split.
+
+    Frames are grouped into strata keyed by (element combination, size
+    class — see :func:`_size_class`). Within each stratum ``valid_ratio``
+    of the frames is held out for validation; strata with fewer than
+    ``min_stratum`` frames go ENTIRELY to training. Rationale: with many
+    element types a random split inevitably drops some rare stratum — e.g.
+    the only few Mo-Pd dimer curves — fully into validation, so the model
+    never sees that pair's short-range physics and can only fail on it.
+    Stratifying guarantees every represented (composition, size) group is
+    learned, and rare groups are never wasted on validation. The held-out
+    fraction is therefore slightly below ``valid_ratio`` (rare strata
+    contribute nothing); the validation set measures within-stratum
+    generalization only.
+
+    ``tiny_to_train`` (default True): tiny cells (size class 0, <= 4
+    atoms — dimer/trimer short-range scans) go ENTIRELY to training
+    regardless of stratum size. Their per-pair curves are sparse in
+    configuration space even when the stratum is populous, and their job
+    is to teach the short-range physics — holding some out both starves
+    the model and produces the dominant validation-error tail.
+
+    ``metas``: sequence of (natoms, iterable_of_species) per frame, in file
+    order. Deterministic for a given ``run_seed``; the trainers and
+    :func:`export_valid_split` share this implementation.
+
+    Returns ``(train_idx, valid_idx, stats)`` — index lists sorted in input
+    order plus a stats dict (n_strata, n_rare_strata, n_rare_frames,
+    n_tiny_frames).
+    """
+    import torch
+    if run_seed is None:
+        raise ValueError("run_seed is required: the split is drawn from it")
+    if not 0.0 < valid_ratio < 1.0:
+        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    strata = {}
+    for i, (na, sp) in enumerate(metas):
+        key = ("-".join(sorted(set(sp))), _size_class(na))
+        strata.setdefault(key, []).append(i)
+
+    g = torch.Generator()
+    g.manual_seed(run_seed)
+    val, n_rare, n_rare_frames, n_tiny = [], 0, 0, 0
+    for key in sorted(strata):
+        idxs = strata[key]
+        if tiny_to_train and key[1] == 0:
+            n_tiny += len(idxs)
+            continue
+        if len(idxs) < min_stratum:
+            n_rare += 1
+            n_rare_frames += len(idxs)
+            continue
+        perm = torch.randperm(len(idxs), generator=g).tolist()
+        n_val = min(max(1, int(round(valid_ratio * len(idxs)))),
+                    len(idxs) - 1)
+        val.extend(idxs[p] for p in perm[:n_val])
+    # Fallback: when the eligible pool is too small for a meaningful
+    # holdout (e.g. a dataset made ENTIRELY of tiny cells, which
+    # tiny_to_train sends to training), a starved validation set would be
+    # useless-to-empty — fall back to a plain random split (same seed) and
+    # report it via stats["fallback"] so callers can log it.
+    if len(val) < max(1, int(round(0.5 * valid_ratio * len(metas)))):
+        train_idx, val_idx = valid_split_indices(len(metas), valid_ratio,
+                                                 run_seed)
+        stats = {"n_strata": len(strata), "n_rare_strata": n_rare,
+                 "n_rare_frames": n_rare_frames, "n_tiny_frames": n_tiny,
+                 "fallback": "random"}
+        return train_idx, val_idx, stats
+    val_set = set(val)
+    train_idx = [i for i in range(len(metas)) if i not in val_set]
+    stats = {"n_strata": len(strata), "n_rare_strata": n_rare,
+             "n_rare_frames": n_rare_frames, "n_tiny_frames": n_tiny}
+    return train_idx, sorted(val_set), stats

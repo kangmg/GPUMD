@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 NEP4 calculator for PyTorch.
@@ -27,6 +27,7 @@ import numpy as np
 from typing import Dict
 
 from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2
+from .data import cutoff_pair_table
 from .neighbor import build_neighbor_list, CellList
 from . import ops
 
@@ -94,6 +95,13 @@ class NEPCalculator:
         self.device = torch.device(device)
         self._load_model(model_file)
 
+    def cutoff_args(self):
+        """``(rc_radial, rc_angular)`` for the basis functions: floats for
+        uniform cutoffs, the (T, T) element-pair tables per species."""
+        if self.rc_radial_per_type is None:
+            return self.rc_radial, self.rc_angular
+        return self.rc_radial_pair, self.rc_angular_pair
+
     def _load_model(self, path: str):
         with open(path) as f:
             lines = f.readlines()
@@ -117,6 +125,10 @@ class NEPCalculator:
             self.zbl_rc_inner = float(parts[1])
             self.zbl_rc_outer = float(parts[2])
             self.zbl_typewise_factor = float(parts[3]) if len(parts) > 3 else None
+            # "zbl 0 0": flexible ZBL, per-pair table after the q_scaler
+            self.zbl_flexible = (self.zbl_rc_inner == 0.0 and self.zbl_rc_outer == 0.0)
+            if self.zbl_flexible:
+                self.zbl_typewise_factor = None
             idx += 1
 
             if self.zbl_typewise_factor is not None:
@@ -131,11 +143,32 @@ class NEPCalculator:
             self.zbl_rc_inner = None
             self.zbl_rc_outer = None
             self.zbl_typewise_factor = None
+            self.zbl_flexible = False
 
-        # Cutoff
+        # Cutoff line: "cutoff rR rA MN_R MN_A" or, per species (GPUMD),
+        # "cutoff rR1 rA1 ... rRn rAn MN_R MN_A" (2 * num_types + 3 tokens):
+        # the pair cutoff is the mean of the two species' values.
         parts = lines[idx].split()
-        self.rc_radial = float(parts[1])
-        self.rc_angular = float(parts[2])
+        vals = [float(x) for x in parts[1:]]
+        if len(vals) == 2 * self.num_types + 2 and self.num_types > 1:
+            self.rc_radial_per_type = vals[0:2 * self.num_types:2]
+            self.rc_angular_per_type = vals[1:2 * self.num_types:2]
+        elif len(vals) >= 2:
+            self.rc_radial_per_type = self.rc_angular_per_type = None
+        else:
+            raise ValueError(f"{path}: malformed cutoff line {lines[idx]!r}")
+        if self.rc_radial_per_type is None:
+            self.rc_radial, self.rc_angular = vals[0], vals[1]
+            self.rc_radial_pair = self.rc_angular_pair = None
+        else:
+            self.rc_radial = max(self.rc_radial_per_type)
+            self.rc_angular = max(self.rc_angular_per_type)
+            self.rc_radial_pair = torch.tensor(
+                cutoff_pair_table(self.rc_radial_per_type),
+                dtype=self.dtype, device=self.device)
+            self.rc_angular_pair = torch.tensor(
+                cutoff_pair_table(self.rc_angular_per_type),
+                dtype=self.dtype, device=self.device)
         idx += 1
 
         # n_max, basis_size, l_max
@@ -229,6 +262,27 @@ class NEPCalculator:
             data[di:di + self.dim], dtype=self.dtype, device=self.device)
         di += self.dim
 
+        # flexible ZBL table (GPUMD zbl.in order: 1-1, 1-2, ..., n-n; each
+        # row rc_inner rc_outer a1..a8) -> per-type-pair tables
+        self._zbl_pair_tables = {}
+        if self.has_zbl and self.zbl_flexible:
+            from .data import zbl_pair_index
+            T = self.num_types
+            n_pairs = T * (T + 1) // 2
+            tab = np.array(data[di:di + 10 * n_pairs]).reshape(n_pairs, 10)
+            di += 10 * n_pairs
+            rc_i = np.zeros((T, T)); rc_o = np.zeros((T, T)); phi = np.zeros((T, T, 8))
+            for t1 in range(T):
+                for t2 in range(T):
+                    row = tab[zbl_pair_index(t1, t2, T)]
+                    rc_i[t1, t2], rc_o[t1, t2], phi[t1, t2] = row[0], row[1], row[2:]
+            self.zbl_table = tab
+            self.zbl_rc_inner, self.zbl_rc_outer = float(rc_i.min()), float(rc_o.max())
+            self._zbl_pair_tables = dict(
+                rc_inner_pair=torch.tensor(rc_i, dtype=self.dtype, device=self.device),
+                rc_outer_pair=torch.tensor(rc_o, dtype=self.dtype, device=self.device),
+                phi_pair=torch.tensor(phi, dtype=self.dtype, device=self.device))
+
         # Pre-build constants
         self._c3b  = torch.tensor(C3B[:self.num_lm], dtype=self.dtype, device=self.device)
         self._c4b  = torch.tensor(C4B,  dtype=self.dtype, device=self.device)
@@ -282,8 +336,9 @@ class NEPCalculator:
             pos_np, cell_np, max_rc, device=self.device, dtype=self.dtype)
         dij = torch.norm(rij, dim=-1)
 
-        rad_mask = dij < self.rc_radial
-        ang_mask = dij < self.rc_angular
+        rc_r, rc_a = self.cutoff_args()
+        rad_mask = dij < ops.pair_cutoff(rc_r, atom_types, pair_i, pair_j)
+        ang_mask = dij < ops.pair_cutoff(rc_a, atom_types, pair_i, pair_j)
 
         rij_rad = rij[rad_mask].detach().requires_grad_(True)
         rij_ang = rij[ang_mask].detach().requires_grad_(True)
@@ -293,7 +348,7 @@ class NEPCalculator:
         q = ops.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,
             atom_types, N, self.c2, self.c3,
-            self.rc_radial, self.rc_angular,
+            rc_r, rc_a,
             self.basis_size_radial, self.basis_size_angular,
             self.n_max_radial, self.n_max_angular,
             self.l_max_3b,
@@ -321,7 +376,7 @@ class NEPCalculator:
                 self.zbl_typewise_factor,
                 getattr(self, "zbl_rc_inner_per_type", None),
                 getattr(self, "zbl_rc_outer_per_type", None),
-                self.dtype, self.device,
+                self.dtype, self.device, **self._zbl_pair_tables,
             )
 
         Ei_total = Ei_nep if Ei_zbl is None else Ei_nep + Ei_zbl
@@ -440,7 +495,7 @@ class NEPCalculator:
                     self.zbl_typewise_factor,
                     getattr(self, "zbl_rc_inner_per_type", None),
                     getattr(self, "zbl_rc_outer_per_type", None),
-                    dtype, device,
+                    dtype, device, **self._zbl_pair_tables,
                 )
                 if Ei_zbl.requires_grad:
                     g_zbl = torch.autograd.grad(
@@ -617,7 +672,7 @@ class NEPCalculator:
         if compile:
             # bmm backend is compile-friendly (no per-type Python loop). Compile
             # once and cache on the instance so MD steps reuse the dynamic graph.
-            backend = "bmm"
+            backend = "mulsum"
             if not hasattr(self, "_desc_compiled"):
                 self._desc_compiled = torch.compile(
                     ops.compute_descriptors_cached, dynamic=True)
@@ -625,7 +680,8 @@ class NEPCalculator:
                     ops.compute_analytical_forces, dynamic=True)
             desc_fn, force_fn = self._desc_compiled, self._force_compiled
         else:
-            backend = ops.resolve_backend(backend, num_types=self.num_types)
+            backend = ops.resolve_backend(backend, num_types=self.num_types,
+                                          device_type=self.device.type)
             desc_fn, force_fn = (ops.compute_descriptors_cached,
                                  ops.compute_analytical_forces)
         c2 = self.c2
@@ -641,18 +697,23 @@ class NEPCalculator:
             rij = rij.to(dtype)
             dij = torch.norm(rij, dim=-1)
 
-            rad = dij < self.rc_radial
-            ang = dij < self.rc_angular
+            rc_r_tab, rc_a_tab = self.cutoff_args()
+            rc_r = ops.pair_cutoff(rc_r_tab, atom_types, pi, pj)
+            rc_a = ops.pair_cutoff(rc_a_tab, atom_types, pi, pj)
+            rad = dij < rc_r
+            ang = dij < rc_a
             pir, pjr, rij_r, dr = pi[rad], pj[rad], rij[rad], dij[rad]
             pia, pja, rij_a, da = pi[ang], pj[ang], rij[ang], dij[ang]
+            if isinstance(rc_r, torch.Tensor):
+                rc_r, rc_a = rc_r[rad], rc_a[ang]
 
             # Cached basis for this block's pairs (analytical-force inputs).
             fk_r, fkp_r = ops.chebyshev_basis_and_deriv(
-                dr, self.rc_radial, self.basis_size_radial)
+                dr, rc_r, self.basis_size_radial)
             d12inv_r = 1.0 / dr.clamp(min=1e-10)
             if rij_a.shape[0] > 0:
                 fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
-                    da, self.rc_angular, self.basis_size_angular)
+                    da, rc_a, self.basis_size_angular)
                 d12inv_a = 1.0 / da.clamp(min=1e-10)
                 blm = ops.angular_basis(rij_a[:, 0] * d12inv_a,
                                         rij_a[:, 1] * d12inv_a,
@@ -703,7 +764,7 @@ class NEPCalculator:
                         self.zbl_typewise_factor,
                         getattr(self, "zbl_rc_inner_per_type", None),
                         getattr(self, "zbl_rc_outer_per_type", None),
-                        dtype, device)
+                        dtype, device, **self._zbl_pair_tables)
                     g_zbl = (torch.autograd.grad(Ei_zbl.sum(), rij_zbl,
                                                  allow_unused=True)[0]
                              if Ei_zbl.requires_grad else None)

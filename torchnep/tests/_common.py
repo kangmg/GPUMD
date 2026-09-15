@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """Shared helpers for the torchnep test suite.
 
@@ -66,6 +66,33 @@ FIXTURES = [
                  "Multi-frame: original (NN ~1.5 A) plus compressed/rattled "
                  "frames down to NN ~1.18 A that drive the ZBL repulsion "
                  "to/below its inner cutoff (1.25 A).",
+    },
+    {
+        "name":  "CrCoNi_unizbl",
+        "nep":   DATA_DIR / "nep_CrCoNi_unizbl.txt",
+        "xyz":   DATA_DIR / "CrCoNi.xyz",
+        "ref":   DATA_DIR / "CrCoNi_unizbl.gpumd.npz",
+        "note":  "Same weights as CrCoNi with the UNIVERSAL ZBL (zbl 1.25 2.5, "
+                 "no typewise factor).",
+    },
+    {
+        "name":  "CrCoNi_flexzbl",
+        "nep":   DATA_DIR / "nep_CrCoNi_flexzbl.txt",
+        "xyz":   DATA_DIR / "CrCoNi.xyz",
+        "ref":   DATA_DIR / "CrCoNi_flexzbl.gpumd.npz",
+        "note":  "Same weights as CrCoNi with the FLEXIBLE ZBL ('zbl 0 0' + a "
+                 "6-row per-pair table at the end, written by torchnep from "
+                 "data/CrCoNi_flexzbl.zbl.in: pair-specific cutoffs and "
+                 "screening coefficients).",
+    },
+    {
+        "name":  "CrCoNi_multicut",
+        "nep":   DATA_DIR / "nep_CrCoNi_multicut.txt",
+        "xyz":   DATA_DIR / "CrCoNi.xyz",
+        "ref":   DATA_DIR / "CrCoNi_multicut.gpumd.npz",
+        "note":  "Same weights as CrCoNi with PER-SPECIES cutoffs "
+                 "(cutoff 6 4 5 3.5 4.5 3: Cr 6/4, Co 5/3.5, Ni 4.5/3 A; the "
+                 "pair cutoff is the mean of the two species' values).",
     },
 ]
 
@@ -183,15 +210,27 @@ def parse_nep_header(nep_path: Path) -> dict:
                 out["num_types"] = int(parts[1])
                 out["type_names"] = parts[2:2 + out["num_types"]]
             elif key == "zbl":
-                # "zbl <rc_inner> <rc_outer>" or with typewise factor at end
+                # "zbl <rc_inner> <rc_outer>" or with typewise factor at end;
+                # "zbl 0 0" = flexible ZBL (per-pair table at the file end)
                 if len(parts) == 4:
                     out["zbl_outer"] = float(parts[2])
                     out["zbl_factor"] = float(parts[3])
                 else:
                     out["zbl_outer"] = float(parts[2])
+                if float(parts[1]) == 0.0 and float(parts[2]) == 0.0:
+                    out["zbl_flexible"] = True
             elif key == "cutoff":
-                out["rc_radial"]  = float(parts[1])
-                out["rc_angular"] = float(parts[2])
+                # "cutoff rR rA MN_R MN_A" or per species
+                # "cutoff rR1 rA1 ... rRn rAn MN_R MN_A"
+                vals = [float(x) for x in parts[1:]]
+                nt = out["num_types"]
+                if nt > 1 and len(vals) == 2 * nt + 2:
+                    out["rc_radial_per_type"] = vals[0:2 * nt:2]
+                    out["rc_angular_per_type"] = vals[1:2 * nt:2]
+                    out["rc_radial"] = max(out["rc_radial_per_type"])
+                    out["rc_angular"] = max(out["rc_angular_per_type"])
+                else:
+                    out["rc_radial"], out["rc_angular"] = vals[0], vals[1]
             elif key == "n_max":
                 out["n_max_radial"]  = int(parts[1])
                 out["n_max_angular"] = int(parts[2])
@@ -212,11 +251,18 @@ def write_nep_in(hdr: dict, dst: Path, output_descriptor: int = 0) -> None:
     ``output_descriptor`` in {0, 1, 2}: 0 disables descriptor.out; 1 writes
     one row per frame (averaged); 2 writes one row per atom.
     """
+    def _g(v):
+        return str(int(v)) if float(v) == int(v) else f"{v:g}"
+    if hdr.get("rc_radial_per_type"):
+        cut = " ".join(f"{_g(r)} {_g(a)}" for r, a in
+                       zip(hdr["rc_radial_per_type"], hdr["rc_angular_per_type"]))
+    else:
+        cut = f"{_g(hdr['rc_radial'])} {_g(hdr['rc_angular'])}"
     lines = [
         f"type {hdr['num_types']} {' '.join(hdr['type_names'])}",
         "prediction 1",
         "batch 1",
-        f"cutoff {int(hdr['rc_radial'])} {int(hdr['rc_angular'])}",
+        f"cutoff {cut}",
         f"n_max {hdr['n_max_radial']} {hdr['n_max_angular']}",
         f"basis_size {hdr['basis_size_radial']} {hdr['basis_size_angular']}",
         # Pad l_max to 5 fields with zeros (new GPUMD format accepts 1–5
@@ -224,10 +270,30 @@ def write_nep_in(hdr: dict, dst: Path, output_descriptor: int = 0) -> None:
         f"l_max {' '.join(str(x) for x in (hdr['l_max'] + [0] * 5)[:5])}",
         f"neuron {hdr['neuron']}",
     ]
-    if "zbl_outer" in hdr:
+    if hdr.get("zbl_flexible"):
+        # GPUMD needs a (valid, unused) cutoff on the zbl line and reads the
+        # per-pair parameters from zbl.in in the working directory
+        lines.append("zbl 2")
+    elif "zbl_outer" in hdr:
         lines.append(f"zbl {hdr['zbl_outer']}")
         if "zbl_factor" in hdr:
             lines.append(f"use_typewise_cutoff_zbl {hdr['zbl_factor']}")
     if output_descriptor:
         lines.append(f"output_descriptor {output_descriptor}")
     dst.write_text("\n".join(lines) + "\n")
+
+
+def torchrun_cmd(nproc: int = 2) -> List[str]:
+    """torchrun prefix for the opt-in multi-process tests. A static rendezvous on
+    127.0.0.1 with a free port: ``--standalone`` advertises the machine's host
+    name, which does not resolve on some laptops (macOS ``*.local``) and then
+    the workers retry the store connection forever."""
+    import shutil
+    import socket
+    torchrun = shutil.which("torchrun")
+    if torchrun is None:
+        return []
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
+    return [torchrun, "--rdzv-backend=static", f"--rdzv-endpoint=127.0.0.1:{port}",
+            "--nnodes=1", f"--nproc-per-node={nproc}"]
