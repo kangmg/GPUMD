@@ -49,6 +49,34 @@ Optional extras: `torchnep[ase]` (ASE calculator), `torchnep[plot]` (figures: ma
 
 ---
 
+## qNEP mode 2 reference and dedicated trainer
+
+The independent qNEP path is for neutral, fully three-dimensional periodic
+mode-2 calculations. It keeps the ordinary `train_nep` APIs unchanged. Install
+PyTorch, NumPy, and ASE in the environment you select; these remain optional
+package dependencies.
+
+The original small reference route remains available:
+
+```bash
+python -m torchnep.qnep train.xyz --elements H O --checkpoint qnep.pt --steps 100
+```
+
+For held-out validation, reproducible checkpoints, and resume, use the
+dedicated route with separate curated train and validation files:
+
+```bash
+python -m torchnep.qnep train.xyz --validation valid.xyz --output-dir qnep-run \
+  --elements H O --epochs 100 --batch-size 2 --precision float64
+```
+
+It writes the latest inference model, the strictly best validation model, and
+a resumable training checkpoint. See [the qNEP reference](QNEP_REFERENCE.md)
+for record metadata, masks and weights, provenance and resume rules, supported
+boundaries, and the required local GPU/GPUMD validation.
+
+---
+
 ## 📄 Training data (extended-XYZ)
 
 TorchNEP reads extended-XYZ files. The parser is strict — the rules below are
