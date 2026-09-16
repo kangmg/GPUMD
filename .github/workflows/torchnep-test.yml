@@ -1,20 +1,30 @@
 name: TorchNEP tests
 
-# Run the TorchNEP pytest suite only when TorchNEP *code* changes — i.e. a .py
-# file under torchnep/, the package config, or this workflow itself. Doc-only
-# edits (README, etc.) do NOT trigger it, and ordinary GPUMD (C++/CUDA) pull
-# requests are unaffected.
+# Run the CPU suite for package, qNEP documentation, qNEP comparison fixtures,
+# and the numerical GPUMD implementation paths that the comparison covers.
+# CUDA and external-GPUMD checks intentionally report skips here; release
+# evidence still requires the documented local GPU/GPUMD command.
 on:
   pull_request:
     paths:
-      - 'torchnep/**.py'
-      - 'torchnep/pyproject.toml'
+      - 'torchnep/**'
+      - 'tests_pytest/fixtures/models/qnep_mode2_*.txt'
+      - 'tests_pytest/fixtures/structures/water-nat63-from-md.xyz'
+      - 'tests_pytest/fixtures/structures/BaTiO3-nat40-rattled.xyz'
+      - 'src/force/ewald.cu'
+      - 'src/force/nep_charge.cu'
+      - 'src/utilities/nep_utilities.cuh'
       - '.github/workflows/torchnep-test.yml'
   push:
     branches: [master]
     paths:
-      - 'torchnep/**.py'
-      - 'torchnep/pyproject.toml'
+      - 'torchnep/**'
+      - 'tests_pytest/fixtures/models/qnep_mode2_*.txt'
+      - 'tests_pytest/fixtures/structures/water-nat63-from-md.xyz'
+      - 'tests_pytest/fixtures/structures/BaTiO3-nat40-rattled.xyz'
+      - 'src/force/ewald.cu'
+      - 'src/force/nep_charge.cu'
+      - 'src/utilities/nep_utilities.cuh'
       - '.github/workflows/torchnep-test.yml'
 
 defaults:

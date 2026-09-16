@@ -1,5 +1,19 @@
 # Release Notes
 
+## 1.0.5a1+qnep2
+
+- Adds the dedicated qNEP mode-2 training contract: explicit held-out
+  validation, masked and externally weighted records, best/latest inference
+  artifacts, and versioned resumable training state.
+- Preserves inference checkpoints as
+  `torchnep-qnep-mode2-reference-v1`; resumable training state uses the
+  separate `torchnep-qnep-mode2-training-v1` format.
+- Adds package documentation for record provenance, resume restrictions,
+  numerical scope, and required local GPU/GPUMD evidence. `QNEP_REFERENCE.md`
+  is included in source distributions.
+- Keeps Python `>=3.9`, empty required dependencies, ordinary TorchNEP APIs,
+  and the existing module CLI route unchanged.
+
 ## 1.0.5a1
 
 - **Plotting**: new `torchnep.plot.NEPPlotter` (needs matplotlib,

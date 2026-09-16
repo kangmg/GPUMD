@@ -8,6 +8,36 @@ pytest tests/ -k float32           # one dtype
 TEST_DEVICE=cpu pytest tests/      # restrict device (default: cpu + cuda if present)
 ```
 
+### qNEP mode 2
+
+The focused CPU regression set covers numerical derivatives and symmetries,
+curated-record parsing and fingerprints, masked/weighted batches, reference
+and training checkpoint boundaries, dedicated training/CLI/resume behavior,
+and ASE runtime checks:
+
+```bash
+TEST_DEVICE=cpu pytest -ra \
+  tests/test_qnep_reference.py tests/test_qnep_numerics.py \
+  tests/test_qnep_records.py tests/test_qnep_batching.py \
+  tests/test_qnep_training_checkpoint.py tests/test_qnep_trainer.py \
+  tests/test_qnep_training_cli.py tests/test_qnep_resume.py
+```
+
+The GitHub workflow runs the CPU suite. CUDA-only checks are explicitly
+skipped on CPU runners, and a missing `GPUMD_QNEP_BINARY` explicitly skips the
+external comparison. Those skips are not GPUMD validation. Before a release,
+run the comparison against the exact-worktree binary and retain its output:
+
+```bash
+GPUMD_QNEP_BINARY=/absolute/path/to/gpumd \
+  python -m pytest -ra tests/test_qnep_gpumd.py -s
+```
+
+This exercises the water model and a derived non-ZBL Ba/Ti/O comparison model;
+the repository's original ZBL fixture must remain rejected. Numerical and
+software tests do not establish material accuracy, vacuum convergence, or MD
+stability.
+
 | file | covers |
 | --- | --- |
 | `test_gpumd_parity.py` | E / F / V / descriptor vs the GPUMD reference (incl. compressed CrCoNi frames where ZBL forces reach ~120 eV/Å); analytical vs autograd; train path vs predict path. |
