@@ -1,0 +1,1223 @@
+{
+  "schema_version": 1,
+  "measured_date": "2026-09-17",
+  "model_commit": "36232ab02ec3551b1214f9bfc9b24cf7302d1324",
+  "hardware": {
+    "cpu": "Intel Core i9-12900",
+    "os": "Linux under Microsoft WSL",
+    "logical_cpus": 24,
+    "process_affinity_cpus": 24,
+    "default_torch_intraop": 12,
+    "default_torch_interop": 12,
+    "gpu": "NVIDIA GeForce RTX 3080 12 GiB",
+    "physical_core_use_measured": false
+  },
+  "method": {
+    "warmups": 2,
+    "repetitions": 3,
+    "statistic": "median wall time with CUDA pre/post synchronization",
+    "training_timing": "zero_grad + loss forward + backward + finite checks + Adam step",
+    "excluded": "input/label preparation, initial device transfer, state reset, validation, checkpoints",
+    "model_and_optimizer_reset_each_repeat": true,
+    "nonzero_energy_force_residuals": true,
+    "cpu_thread_control": "torch.set_num_threads only; interop unchanged; no affinity pinning or independent NumPy/BLAS pool controls",
+    "source_path_redaction": "absolute source paths replaced with repository-relative paths"
+  },
+  "gpu_start_utilization_percent": [
+    1,
+    0,
+    3,
+    2,
+    2
+  ],
+  "gpu_end_utilization_percent": [
+    0,
+    3,
+    6,
+    14,
+    23
+  ],
+  "scale": [
+    {
+      "stage": "environment",
+      "head": "36232ab02ec3551b1214f9bfc9b24cf7302d1324",
+      "torch": "2.12.1+cu126",
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "gpu_state": "0, 1760, 12288",
+      "config": {
+        "type_names": [
+          "H",
+          "O"
+        ],
+        "cutoff_radial": 6,
+        "cutoff_angular": 4,
+        "n_max_radial": 2,
+        "n_max_angular": 2,
+        "basis_size_radial": 4,
+        "basis_size_angular": 4,
+        "l_max": [
+          2,
+          0,
+          0
+        ],
+        "neuron": 16,
+        "reciprocal_cutoff_factor": 1
+      },
+      "tf32_matmul": false,
+      "source": "torchnep/torchnep/qnep/model.py"
+    },
+    {
+      "stage": "timing",
+      "atoms": 3,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "forward",
+      "samples_ms": [
+        2.8387829661369324,
+        2.957049000542611,
+        2.4771809694357216
+      ],
+      "median_ms": 2.8387829661369324,
+      "records_per_s": 352.2636326653806,
+      "optimizer_steps": 0,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "5, 1771, 12288",
+      "gpu_after": "0, 1771, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 3,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        6.669443973805755,
+        5.667172954417765,
+        6.075060984585434
+      ],
+      "median_ms": 6.075060984585434,
+      "records_per_s": 164.60740106763564,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "0, 1771, 12288",
+      "gpu_after": "2, 1769, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "forward",
+      "samples_ms": [
+        7.027649029623717,
+        6.503671989776194,
+        7.074863009620458
+      ],
+      "median_ms": 7.027649029623717,
+      "records_per_s": 142.29509694987473,
+      "optimizer_steps": 0,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "2, 1769, 12288",
+      "gpu_after": "2, 1769, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        12.403490021824837,
+        11.525198991876096,
+        11.43645797856152
+      ],
+      "median_ms": 11.525198991876096,
+      "records_per_s": 86.7663977606705,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "2, 1769, 12288",
+      "gpu_after": "0, 1769, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "forward",
+      "samples_ms": [
+        58.22459195042029,
+        53.0788809992373,
+        54.688295000232756
+      ],
+      "median_ms": 54.688295000232756,
+      "records_per_s": 18.285448467459883,
+      "optimizer_steps": 0,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "0, 1769, 12288",
+      "gpu_after": "4, 1763, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        68.90843401197344,
+        67.32455303426832,
+        66.72336300835013
+      ],
+      "median_ms": 67.32455303426832,
+      "records_per_s": 14.85342204189604,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "11, 1764, 12288",
+      "gpu_after": "2, 1764, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float64",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "forward",
+      "samples_ms": [
+        7.5067790457978845,
+        6.983555038459599,
+        6.801476003602147
+      ],
+      "median_ms": 6.983555038459599,
+      "records_per_s": 143.19354461915654,
+      "optimizer_steps": 0,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "2, 1764, 12288",
+      "gpu_after": "0, 1764, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float64",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        13.546832953579724,
+        14.5007370156236,
+        15.24952898034826
+      ],
+      "median_ms": 14.5007370156236,
+      "records_per_s": 68.96201199446381,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "0, 1764, 12288",
+      "gpu_after": "0, 1763, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 3,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "forward",
+      "samples_ms": [
+        16.083260998129845,
+        17.716671980451792,
+        18.46360304625705
+      ],
+      "median_ms": 17.716671980451792,
+      "records_per_s": 56.4440094112133,
+      "optimizer_steps": 0,
+      "cuda_peak_allocated_mb": 16.35107421875,
+      "gpu_before": "17, 2015, 12288",
+      "gpu_after": "4, 2089, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 3,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        35.53273202851415,
+        37.80761297093704,
+        43.91712404321879
+      ],
+      "median_ms": 37.80761297093704,
+      "records_per_s": 26.449699449915194,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 16.380859375,
+      "gpu_before": "10, 2089, 12288",
+      "gpu_after": "3, 2089, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "forward",
+      "samples_ms": [
+        21.027381997555494,
+        20.21046099252999,
+        22.336882015224546
+      ],
+      "median_ms": 21.027381997555494,
+      "records_per_s": 47.55703777656455,
+      "optimizer_steps": 0,
+      "cuda_peak_allocated_mb": 17.9580078125,
+      "gpu_before": "17, 2088, 12288",
+      "gpu_after": "10, 2080, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        44.7694209869951,
+        43.86997997062281,
+        42.90125600527972
+      ],
+      "median_ms": 43.86997997062281,
+      "records_per_s": 22.794630876732615,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 19.03076171875,
+      "gpu_before": "10, 2080, 12288",
+      "gpu_after": "21, 2083, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "forward",
+      "samples_ms": [
+        61.89882999751717,
+        62.847997003700584,
+        62.98048695316538
+      ],
+      "median_ms": 62.847997003700584,
+      "records_per_s": 15.911406053897286,
+      "optimizer_steps": 0,
+      "cuda_peak_allocated_mb": 24.578125,
+      "gpu_before": "21, 2083, 12288",
+      "gpu_after": "8, 2085, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        105.10644700843841,
+        92.10493101272732,
+        89.60878296056762
+      ],
+      "median_ms": 92.10493101272732,
+      "records_per_s": 10.857182009742965,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 31.06689453125,
+      "gpu_before": "6, 2085, 12288",
+      "gpu_after": "11, 2082, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float64",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "forward",
+      "samples_ms": [
+        23.835386033169925,
+        32.11145801469684,
+        39.409444958437234
+      ],
+      "median_ms": 32.11145801469684,
+      "records_per_s": 31.141532083106224,
+      "optimizer_steps": 0,
+      "cuda_peak_allocated_mb": 19.43798828125,
+      "gpu_before": "11, 2079, 12288",
+      "gpu_after": "8, 2112, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float64",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        49.52996503561735,
+        47.77142300736159,
+        69.55590500729159
+      ],
+      "median_ms": 49.52996503561735,
+      "records_per_s": 20.18979822176117,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 21.3291015625,
+      "gpu_before": "11, 2112, 12288",
+      "gpu_after": "17, 2112, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 12,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        14.087738003581762,
+        13.56541900895536,
+        17.037221987266093
+      ],
+      "median_ms": 14.087738003581762,
+      "records_per_s": 70.98371645936014,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "19, 2188, 12288",
+      "gpu_after": "3, 2191, 12288"
+    }
+  ],
+  "batch": [
+    {
+      "stage": "environment",
+      "head": "36232ab02ec3551b1214f9bfc9b24cf7302d1324",
+      "torch": "2.12.1+cu126",
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "gpu_state": "0, 1674, 12288",
+      "config": {
+        "type_names": [
+          "H",
+          "O"
+        ],
+        "cutoff_radial": 6,
+        "cutoff_angular": 4,
+        "n_max_radial": 2,
+        "n_max_angular": 2,
+        "basis_size_radial": 4,
+        "basis_size_angular": 4,
+        "l_max": [
+          2,
+          0,
+          0
+        ],
+        "neuron": 16,
+        "reciprocal_cutoff_factor": 1
+      },
+      "tf32_matmul": false,
+      "source": "torchnep/torchnep/qnep/model.py"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        97.53333998378366,
+        101.27714602276683,
+        98.35018595913425
+      ],
+      "median_ms": 98.35018595913425,
+      "records_per_s": 81.3419915985121,
+      "optimizer_steps": 8,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "5, 1674, 12288",
+      "gpu_after": "6, 1674, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 4,
+      "method": "serial",
+      "samples_ms": [
+        103.25950098922476,
+        101.00028099259362,
+        104.8909219680354
+      ],
+      "median_ms": 103.25950098922476,
+      "records_per_s": 77.47471102765458,
+      "optimizer_steps": 2,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "2, 1674, 12288",
+      "gpu_after": "0, 1674, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 4,
+      "method": "tensor",
+      "samples_ms": [
+        67.2750580124557,
+        69.70237701898441,
+        65.25464000878856
+      ],
+      "median_ms": 67.2750580124557,
+      "records_per_s": 118.91479898120389,
+      "optimizer_steps": 2,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "0, 1674, 12288",
+      "gpu_after": "0, 1674, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "serial",
+      "samples_ms": [
+        95.44423798797652,
+        92.96854899730533,
+        100.1749910064973
+      ],
+      "median_ms": 95.44423798797652,
+      "records_per_s": 83.81857478926901,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "0, 1674, 12288",
+      "gpu_after": "0, 1674, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        62.96301900874823,
+        64.53451799461618,
+        63.0915739457123
+      ],
+      "median_ms": 63.0915739457123,
+      "records_per_s": 126.79981651565184,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "0, 1674, 12288",
+      "gpu_after": "0, 1674, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        344.15728400927037,
+        345.18752596341074,
+        354.6654090168886
+      ],
+      "median_ms": 345.18752596341074,
+      "records_per_s": 23.175808504876233,
+      "optimizer_steps": 8,
+      "cuda_peak_allocated_mb": 19.05126953125,
+      "gpu_before": "13, 1931, 12288",
+      "gpu_after": "16, 2016, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 4,
+      "method": "serial",
+      "samples_ms": [
+        438.90823097899556,
+        373.21340496419,
+        406.5875490196049
+      ],
+      "median_ms": 406.5875490196049,
+      "records_per_s": 19.675959136698143,
+      "optimizer_steps": 2,
+      "cuda_peak_allocated_mb": 19.0576171875,
+      "gpu_before": "16, 2016, 12288",
+      "gpu_after": "21, 2024, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 4,
+      "method": "tensor",
+      "samples_ms": [
+        120.52564701298252,
+        141.94442803272977,
+        139.77126602549106
+      ],
+      "median_ms": 139.77126602549106,
+      "records_per_s": 57.23637073260097,
+      "optimizer_steps": 2,
+      "cuda_peak_allocated_mb": 27.751953125,
+      "gpu_before": "15, 2036, 12288",
+      "gpu_after": "17, 2032, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "serial",
+      "samples_ms": [
+        340.03262600163,
+        335.03978297812864,
+        357.5933859683573
+      ],
+      "median_ms": 340.03262600163,
+      "records_per_s": 23.527154126562113,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 19.0576171875,
+      "gpu_before": "17, 2032, 12288",
+      "gpu_after": "30, 2027, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        102.33991697896272,
+        97.7661469951272,
+        92.97253703698516
+      ],
+      "median_ms": 97.7661469951272,
+      "records_per_s": 81.82791534577639,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 39.12158203125,
+      "gpu_before": "8, 2027, 12288",
+      "gpu_after": "28, 2059, 12288"
+    }
+  ],
+  "reverse_order_batch8": [
+    {
+      "stage": "environment",
+      "head": "36232ab02ec3551b1214f9bfc9b24cf7302d1324",
+      "torch": "2.12.1+cu126",
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "gpu_state": "0, 1681, 12288",
+      "config": {
+        "type_names": [
+          "H",
+          "O"
+        ],
+        "cutoff_radial": 6,
+        "cutoff_angular": 4,
+        "n_max_radial": 2,
+        "n_max_angular": 2,
+        "basis_size_radial": 4,
+        "basis_size_angular": 4,
+        "l_max": [
+          2,
+          0,
+          0
+        ],
+        "neuron": 16,
+        "reciprocal_cutoff_factor": 1
+      },
+      "tf32_matmul": false,
+      "source": "torchnep/torchnep/qnep/model.py"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        76.6282090335153,
+        92.11803000653163,
+        68.95046104909852
+      ],
+      "median_ms": 76.6282090335153,
+      "records_per_s": 104.40019544892398,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "7, 1690, 12288",
+      "gpu_after": "29, 1720, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "serial",
+      "samples_ms": [
+        96.80333401774988,
+        98.42046204721555,
+        98.97042601369321
+      ],
+      "median_ms": 98.42046204721555,
+      "records_per_s": 81.28391021129464,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "23, 1725, 12288",
+      "gpu_after": "1, 1731, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        98.20806497009471,
+        92.650712991599,
+        89.16384598705918
+      ],
+      "median_ms": 92.650712991599,
+      "records_per_s": 86.34580071418762,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 39.12158203125,
+      "gpu_before": "7, 1987, 12288",
+      "gpu_after": "15, 2099, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "serial",
+      "samples_ms": [
+        332.42793200770393,
+        338.2391409832053,
+        334.8571280366741
+      ],
+      "median_ms": 334.8571280366741,
+      "records_per_s": 23.89078604031934,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 19.0576171875,
+      "gpu_before": "12, 2092, 12288",
+      "gpu_after": "22, 2086, 12288"
+    }
+  ],
+  "parity_batch8": [
+    {
+      "stage": "environment",
+      "head": "36232ab02ec3551b1214f9bfc9b24cf7302d1324",
+      "torch": "2.12.1+cu126",
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "gpu_state": "0, 1684, 12288",
+      "config": {
+        "type_names": [
+          "H",
+          "O"
+        ],
+        "cutoff_radial": 6,
+        "cutoff_angular": 4,
+        "n_max_radial": 2,
+        "n_max_angular": 2,
+        "basis_size_radial": 4,
+        "basis_size_angular": 4,
+        "l_max": [
+          2,
+          0,
+          0
+        ],
+        "neuron": 16,
+        "reciprocal_cutoff_factor": 1
+      },
+      "tf32_matmul": false,
+      "source": "torchnep/torchnep/qnep/model.py"
+    },
+    {
+      "stage": "parity",
+      "device": "cpu",
+      "dtype": "torch.float64",
+      "atoms": 63,
+      "batch": 8,
+      "field_max_errors": [
+        1.7763568394002505e-15,
+        1.7763568394002505e-15,
+        2.710505431213761e-20,
+        6.938893903907228e-18,
+        6.938893903907228e-18,
+        1.6653345369377348e-16
+      ],
+      "gradient_max_error": 3.885780586188048e-16,
+      "loss_reference": 0.004340444459476526,
+      "loss_tensor": 0.004340444459476525,
+      "verdict": "PASS"
+    },
+    {
+      "stage": "parity",
+      "device": "cuda",
+      "dtype": "torch.float32",
+      "atoms": 63,
+      "batch": 8,
+      "field_max_errors": [
+        9.5367431640625e-7,
+        9.5367431640625e-7,
+        1.1641532182693481e-10,
+        7.450580596923828e-9,
+        8.381903171539307e-9,
+        1.043081283569336e-7
+      ],
+      "gradient_max_error": 5.960464477539063e-8,
+      "loss_reference": 0.00434044492430985,
+      "loss_tensor": 0.004340445157140493,
+      "verdict": "PASS"
+    }
+  ],
+  "cpu_threads": [
+    {
+      "stage": "environment",
+      "head": "36232ab02ec3551b1214f9bfc9b24cf7302d1324",
+      "torch": "2.12.1+cu126",
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "gpu_state": "7, 1486, 12288",
+      "config": {
+        "type_names": [
+          "H",
+          "O"
+        ],
+        "cutoff_radial": 6,
+        "cutoff_angular": 4,
+        "n_max_radial": 2,
+        "n_max_angular": 2,
+        "basis_size_radial": 4,
+        "basis_size_angular": 4,
+        "l_max": [
+          2,
+          0,
+          0
+        ],
+        "neuron": 16,
+        "reciprocal_cutoff_factor": 1
+      },
+      "tf32_matmul": false,
+      "logical_cpus": 24,
+      "default_interop_threads": 12,
+      "source": "torchnep/torchnep/qnep/model.py"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        14.21064103487879,
+        13.9576310175471,
+        12.725461041554809
+      ],
+      "median_ms": 13.9576310175471,
+      "records_per_s": 71.64539589439147,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "12, 1454, 12288",
+      "gpu_after": "13, 1454, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        71.25139201525599,
+        65.90630597202107,
+        67.98193597933277
+      ],
+      "median_ms": 67.98193597933277,
+      "records_per_s": 14.709789969853324,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "19, 1454, 12288",
+      "gpu_after": "25, 1473, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        62.913544999901205,
+        61.46348902257159,
+        62.618256022688
+      ],
+      "median_ms": 62.618256022688,
+      "records_per_s": 127.75826904379802,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "30, 1471, 12288",
+      "gpu_after": "29, 1471, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 4,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        13.64057301543653,
+        14.032817969564348,
+        13.361292018089443
+      ],
+      "median_ms": 13.64057301543653,
+      "records_per_s": 73.31070321373869,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "29, 1471, 12288",
+      "gpu_after": "21, 1471, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 4,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        61.13085302058607,
+        63.84072796208784,
+        61.99223600560799
+      ],
+      "median_ms": 61.99223600560799,
+      "records_per_s": 16.131052280636194,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "27, 1471, 12288",
+      "gpu_after": "7, 1471, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 4,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        51.753085979726166,
+        55.0868830177933,
+        53.45937400124967
+      ],
+      "median_ms": 53.45937400124967,
+      "records_per_s": 149.64634639778967,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "4, 1472, 12288",
+      "gpu_after": "4, 1472, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 12,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        14.851921005174518,
+        13.684225967153907,
+        12.895862979348749
+      ],
+      "median_ms": 13.684225967153907,
+      "records_per_s": 73.07684061928593,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "4, 1471, 12288",
+      "gpu_after": "18, 1468, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 12,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        74.61641397094354,
+        78.24632502160966,
+        80.21385798929259
+      ],
+      "median_ms": 78.24632502160966,
+      "records_per_s": 12.780152930170525,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "25, 1469, 12288",
+      "gpu_after": "22, 1480, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 12,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        54.24393597058952,
+        56.880438001826406,
+        56.71619198983535
+      ],
+      "median_ms": 56.71619198983535,
+      "records_per_s": 141.0531934413678,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "16, 1476, 12288",
+      "gpu_after": "23, 1468, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 24,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        27.829178026877344,
+        23.082875995896757,
+        23.109432018827647
+      ],
+      "median_ms": 23.109432018827647,
+      "records_per_s": 43.27237463842828,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "20, 1468, 12288",
+      "gpu_after": "20, 1459, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 24,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        746.4751310180873,
+        787.8092540195212,
+        992.8402380319312
+      ],
+      "median_ms": 787.8092540195212,
+      "records_per_s": 1.2693427944617937,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "18, 1450, 12288",
+      "gpu_after": "15, 1563, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 24,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        432.6377980178222,
+        207.24771299865097,
+        272.22290699137375
+      ],
+      "median_ms": 272.22290699137375,
+      "records_per_s": 29.387681177960182,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "9, 1588, 12288",
+      "gpu_after": "4, 1558, 12288"
+    }
+  ],
+  "reverse_order_cpu_threads": [
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 24,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        3316.106774029322,
+        3141.530364053324,
+        3356.7951250006445
+      ],
+      "median_ms": 3316.106774029322,
+      "records_per_s": 0.30155844432744966,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "97, 3707, 12288",
+      "gpu_after": "98, 3765, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 24,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        5678.387228981592,
+        5771.111670997925,
+        5782.89756400045
+      ],
+      "median_ms": 5771.111670997925,
+      "records_per_s": 1.386214728819597,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "96, 3743, 12288",
+      "gpu_after": "96, 3851, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 252,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 1,
+      "batch": 1,
+      "method": "serial",
+      "samples_ms": [
+        65.77644497156143,
+        67.07443803315982,
+        73.55094602098688
+      ],
+      "median_ms": 67.07443803315982,
+      "records_per_s": 14.908809217389589,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "98, 3851, 12288",
+      "gpu_after": "98, 3851, 12288"
+    },
+    {
+      "stage": "timing",
+      "atoms": 63,
+      "device": "cpu",
+      "dtype": "torch.float32",
+      "threads": 1,
+      "records": 8,
+      "batch": 8,
+      "method": "tensor",
+      "samples_ms": [
+        66.19222497101873,
+        60.23754400666803,
+        63.277214008849114
+      ],
+      "median_ms": 63.277214008849114,
+      "records_per_s": 126.42781647879166,
+      "optimizer_steps": 1,
+      "cuda_peak_allocated_mb": 0,
+      "gpu_before": "98, 3850, 12288",
+      "gpu_after": "97, 3829, 12288"
+    }
+  ],
+  "original_script_sha256": {
+    "benchmark": "2bd2c33cf3c835abf7a7c7c2335e5977cafd488070b08d20c7a7d5771af1acc3",
+    "prototype": "7599eb9c8458426475e144bb3997c68322141a2fd02833b13a736ef3e8823f03"
+  }
+}

@@ -1,0 +1,828 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-17",
+  "model_commit": "36232ab02ec3551b1214f9bfc9b24cf7302d1324",
+  "scope": "PyTorch qNEP reference; CPU-only independent-job throughput, not GPUMD native CUDA or distributed one-model training",
+  "environment": {
+    "cpu": "Intel Core i9-12900",
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "python": "3.12.12",
+    "packages": {
+      "torch": "2.12.1+cu126",
+      "numpy": "2.4.6",
+      "ase": "3.29.0",
+      "threadpoolctl": "3.6.0"
+    },
+    "exclusive_cpu": false,
+    "background_gpu_job_active": true
+  },
+  "model_config": {
+    "type_names": [
+      "H",
+      "O"
+    ],
+    "cutoff": [
+      6.0,
+      4.0
+    ],
+    "n_max": [
+      2,
+      2
+    ],
+    "basis_size": [
+      4,
+      4
+    ],
+    "l_max": [
+      2,
+      0,
+      0
+    ],
+    "neuron": 16,
+    "reciprocal_cutoff_factor": 1.0
+  },
+  "protocol": {
+    "seed": 20260916,
+    "optimizer": "Adam",
+    "lr": 0.0001,
+    "energy_weight": 1.0,
+    "force_weight": 1.0,
+    "charge_weight": 0.01,
+    "total_updates_per_round": 25,
+    "total_structures_per_round": 200,
+    "pool_resident_in_both_conditions": true,
+    "reset_outside_timing": true,
+    "group_includes_dispatch_and_post_loop_checks": true,
+    "order": [
+      "sequential",
+      "concurrent",
+      "concurrent",
+      "sequential",
+      "sequential",
+      "concurrent"
+    ],
+    "startup_includes_imports_preparation_adam_initialization_and_warmup": true,
+    "parameter_repeat_tolerances": {
+      "atol": 1e-07,
+      "rtol": 1e-05
+    },
+    "all_final_parameter_repeat_errors_observed": 0.0,
+    "source_finalization": "After timing, worker commands were parsed with a StrEnum and errors given a benchmark-specific class. The timed training loop was unchanged; final CLI smoke verifies command/reset/run/shutdown."
+  },
+  "independent_job_runs": {
+    "serial": {
+      "command": "uv run --no-project \"$QNEP_BENCH_PYTHON\" torchnep/benchmarks/qnep/cpu_jobs.py serial",
+      "raw_rows": [
+        {
+          "stage": "ready",
+          "pool_startup_seconds": 3.0105417339946143,
+          "workers": [
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2",
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2",
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2",
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2",
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2"
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "sequential",
+          "repetition": 0,
+          "group_seconds": 2.449545878043864,
+          "records_per_second": 81.64778696029738,
+          "workers": [
+            {
+              "seconds": 0.48971428198274225,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685172.0
+            },
+            {
+              "seconds": 0.5036217829911038,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685424.0
+            },
+            {
+              "seconds": 0.47904655599268153,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685696.0
+            },
+            {
+              "seconds": 0.48340838798321784,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685660.0
+            },
+            {
+              "seconds": 0.49186020001070574,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 684636.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "concurrent",
+          "repetition": 0,
+          "group_seconds": 0.6161923979525454,
+          "records_per_second": 324.5739490856272,
+          "workers": [
+            {
+              "seconds": 0.6145968880155124,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685556.0
+            },
+            {
+              "seconds": 0.6154997710254975,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685616.0
+            },
+            {
+              "seconds": 0.5897955049877055,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686272.0
+            },
+            {
+              "seconds": 0.599753618997056,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686236.0
+            },
+            {
+              "seconds": 0.6066024450119585,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685212.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "concurrent",
+          "repetition": 1,
+          "group_seconds": 0.612338669016026,
+          "records_per_second": 326.6166422600459,
+          "workers": [
+            {
+              "seconds": 0.6119197669904679,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685748.0
+            },
+            {
+              "seconds": 0.581698638969101,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685616.0
+            },
+            {
+              "seconds": 0.572392072994262,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686272.0
+            },
+            {
+              "seconds": 0.6026791459880769,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686236.0
+            },
+            {
+              "seconds": 0.6097452370449901,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685212.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "sequential",
+          "repetition": 1,
+          "group_seconds": 2.498668914020527,
+          "records_per_second": 80.04261744233511,
+          "workers": [
+            {
+              "seconds": 0.5382512619835325,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685748.0
+            },
+            {
+              "seconds": 0.48331830598181114,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685616.0
+            },
+            {
+              "seconds": 0.5013962890370749,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686464.0
+            },
+            {
+              "seconds": 0.49141263199271634,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686236.0
+            },
+            {
+              "seconds": 0.48209307296201587,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685212.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "sequential",
+          "repetition": 2,
+          "group_seconds": 2.4195727600017563,
+          "records_per_second": 82.65922120889427,
+          "workers": [
+            {
+              "seconds": 0.48583094001514837,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685748.0
+            },
+            {
+              "seconds": 0.48976702301297337,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685808.0
+            },
+            {
+              "seconds": 0.46962061600061134,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686464.0
+            },
+            {
+              "seconds": 0.4854499170323834,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686236.0
+            },
+            {
+              "seconds": 0.48641841404605657,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685212.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "concurrent",
+          "repetition": 2,
+          "group_seconds": 0.6083606310421601,
+          "records_per_second": 328.75237120026554,
+          "workers": [
+            {
+              "seconds": 0.6038094239775091,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685748.0
+            },
+            {
+              "seconds": 0.5967885790159926,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685808.0
+            },
+            {
+              "seconds": 0.5732917709974572,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686464.0
+            },
+            {
+              "seconds": 0.570746983983554,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 686236.0
+            },
+            {
+              "seconds": 0.6079176949569955,
+              "loss": 0.002664325846126303,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 685404.0
+            }
+          ]
+        },
+        {
+          "stage": "summary",
+          "settings": {
+            "method": "serial",
+            "threads": 2,
+            "jobs": 5,
+            "updates": 5,
+            "repeats": 3
+          },
+          "atoms": 63,
+          "records_per_update": 8,
+          "device": "cpu",
+          "dtype": "float32",
+          "warmups": 2,
+          "logical_cpus": 24,
+          "affinity_cpus": 24,
+          "affinity_pinned": false,
+          "environment_caps": {
+            "OMP_NUM_THREADS": "2",
+            "MKL_NUM_THREADS": "2",
+            "OPENBLAS_NUM_THREADS": "2",
+            "BLIS_NUM_THREADS": "2",
+            "NUMEXPR_NUM_THREADS": "2",
+            "VECLIB_MAXIMUM_THREADS": "2",
+            "CUDA_VISIBLE_DEVICES": ""
+          },
+          "interop_threads": 1,
+          "pool_startup_seconds": 3.0105417339946143,
+          "load_before": [
+            1.046875,
+            1.12353515625,
+            1.251953125
+          ],
+          "load_after": [
+            2.42041015625,
+            1.427734375,
+            1.35009765625
+          ],
+          "median_group_seconds": {
+            "sequential": 2.449545878043864,
+            "concurrent": 0.612338669016026
+          },
+          "speedup": 4.000312248743113,
+          "workers_exited_zero": true
+        }
+      ],
+      "derived": {
+        "sequential": {
+          "median_job_training_seconds": 0.48641841404605657,
+          "aggregate_structures_per_second": 81.64778696029738,
+          "peak_worker_rss_mib_range": [
+            668.58984375,
+            670.375
+          ]
+        },
+        "concurrent": {
+          "median_job_training_seconds": 0.6026791459880769,
+          "aggregate_structures_per_second": 326.6166422600459,
+          "peak_worker_rss_mib_range": [
+            669.15234375,
+            670.375
+          ]
+        }
+      }
+    },
+    "tensor": {
+      "command": "uv run --no-project \"$QNEP_BENCH_PYTHON\" torchnep/benchmarks/qnep/cpu_jobs.py tensor",
+      "raw_rows": [
+        {
+          "stage": "ready",
+          "pool_startup_seconds": 2.7817073949845508,
+          "workers": [
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2",
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2",
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2",
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2",
+            "READY\t2.12.1+cu126\t2\t1\topenmp=2\topenblas=2\topenblas=2"
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "sequential",
+          "repetition": 0,
+          "group_seconds": 1.666058917006012,
+          "records_per_second": 120.04377393772461,
+          "workers": [
+            {
+              "seconds": 0.3432094670133665,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 719420.0
+            },
+            {
+              "seconds": 0.3420583130209707,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 718428.0
+            },
+            {
+              "seconds": 0.325494066986721,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 719164.0
+            },
+            {
+              "seconds": 0.3336772460024804,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 719176.0
+            },
+            {
+              "seconds": 0.3191755980369635,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 718228.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "concurrent",
+          "repetition": 0,
+          "group_seconds": 0.41781652899226174,
+          "records_per_second": 478.6790041130808,
+          "workers": [
+            {
+              "seconds": 0.4170465030474588,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 719420.0
+            },
+            {
+              "seconds": 0.3992313100025058,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 718428.0
+            },
+            {
+              "seconds": 0.38580738595919684,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720452.0
+            },
+            {
+              "seconds": 0.3937843769672327,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720612.0
+            },
+            {
+              "seconds": 0.39439552900148556,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 718228.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "concurrent",
+          "repetition": 1,
+          "group_seconds": 0.40066210500663146,
+          "records_per_second": 499.17373642483545,
+          "workers": [
+            {
+              "seconds": 0.38879624905530363,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 719452.0
+            },
+            {
+              "seconds": 0.38357309804996476,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 718568.0
+            },
+            {
+              "seconds": 0.4002364170155488,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720452.0
+            },
+            {
+              "seconds": 0.38347182603320107,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720612.0
+            },
+            {
+              "seconds": 0.37005733099067584,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720136.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "sequential",
+          "repetition": 1,
+          "group_seconds": 1.4600026469561271,
+          "records_per_second": 136.98605301638878,
+          "workers": [
+            {
+              "seconds": 0.2860699479933828,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 719452.0
+            },
+            {
+              "seconds": 0.3046575409825891,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 718748.0
+            },
+            {
+              "seconds": 0.29567158297868446,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 721748.0
+            },
+            {
+              "seconds": 0.28932443202938884,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720612.0
+            },
+            {
+              "seconds": 0.281414223019965,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720136.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "sequential",
+          "repetition": 2,
+          "group_seconds": 1.4876607969636098,
+          "records_per_second": 134.43924879126345,
+          "workers": [
+            {
+              "seconds": 0.2841756410198286,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 719632.0
+            },
+            {
+              "seconds": 0.30057188897626474,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 718748.0
+            },
+            {
+              "seconds": 0.3088597179739736,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 721748.0
+            },
+            {
+              "seconds": 0.29470395896350965,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720612.0
+            },
+            {
+              "seconds": 0.2965891559724696,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720136.0
+            }
+          ]
+        },
+        {
+          "stage": "round",
+          "condition": "concurrent",
+          "repetition": 2,
+          "group_seconds": 0.4351189360022545,
+          "records_per_second": 459.64444075346734,
+          "workers": [
+            {
+              "seconds": 0.42695042095147073,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 719632.0
+            },
+            {
+              "seconds": 0.4210216559586115,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 718748.0
+            },
+            {
+              "seconds": 0.41742371901636943,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 721748.0
+            },
+            {
+              "seconds": 0.43462067196378484,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720612.0
+            },
+            {
+              "seconds": 0.42216738901333883,
+              "loss": 0.0026643259916454554,
+              "parameter_change_linf": 0.00044292211532592773,
+              "repeat_error_linf": 0.0,
+              "peak_rss_kib": 720356.0
+            }
+          ]
+        },
+        {
+          "stage": "summary",
+          "settings": {
+            "method": "tensor",
+            "threads": 2,
+            "jobs": 5,
+            "updates": 5,
+            "repeats": 3
+          },
+          "atoms": 63,
+          "records_per_update": 8,
+          "device": "cpu",
+          "dtype": "float32",
+          "warmups": 2,
+          "logical_cpus": 24,
+          "affinity_cpus": 24,
+          "affinity_pinned": false,
+          "environment_caps": {
+            "OMP_NUM_THREADS": "2",
+            "MKL_NUM_THREADS": "2",
+            "OPENBLAS_NUM_THREADS": "2",
+            "BLIS_NUM_THREADS": "2",
+            "NUMEXPR_NUM_THREADS": "2",
+            "VECLIB_MAXIMUM_THREADS": "2",
+            "CUDA_VISIBLE_DEVICES": ""
+          },
+          "interop_threads": 1,
+          "pool_startup_seconds": 2.7817073949845508,
+          "load_before": [
+            2.17529296875,
+            1.4423828125,
+            1.35693359375
+          ],
+          "load_after": [
+            3.0234375,
+            1.6435546875,
+            1.42333984375
+          ],
+          "median_group_seconds": {
+            "sequential": 1.4876607969636098,
+            "concurrent": 0.41781652899226174
+          },
+          "speedup": 3.560559943743064,
+          "workers_exited_zero": true
+        }
+      ],
+      "derived": {
+        "sequential": {
+          "median_job_training_seconds": 0.30057188897626474,
+          "aggregate_structures_per_second": 134.43924879126345,
+          "peak_worker_rss_mib_range": [
+            701.39453125,
+            704.83203125
+          ]
+        },
+        "concurrent": {
+          "median_job_training_seconds": 0.3992313100025058,
+          "aggregate_structures_per_second": 478.6790041130808,
+          "peak_worker_rss_mib_range": [
+            701.39453125,
+            704.83203125
+          ]
+        }
+      }
+    }
+  },
+  "supplementary_two_thread_solo": {
+    "protocol": "Original benchmark.measure; Torch intra-op2, default inter-op12; NumPy/BLAS not independently capped. Later shared-machine run, not directly paired with the earlier1/4/12/24 sweep.",
+    "raw_rows": [
+      {
+        "stage": "timing",
+        "atoms": 63,
+        "device": "cpu",
+        "dtype": "torch.float32",
+        "threads": 2,
+        "records": 1,
+        "batch": 1,
+        "method": "serial",
+        "samples_ms": [
+          12.984708009753376,
+          13.028246990870684,
+          11.938026000279933
+        ],
+        "median_ms": 12.984708009753376,
+        "records_per_s": 77.01366863612618,
+        "optimizer_steps": 1,
+        "cuda_peak_allocated_mb": 0.0,
+        "gpu_before": "98, 3643, 12288",
+        "gpu_after": "98, 3643, 12288"
+      },
+      {
+        "stage": "timing",
+        "atoms": 252,
+        "device": "cpu",
+        "dtype": "torch.float32",
+        "threads": 2,
+        "records": 1,
+        "batch": 1,
+        "method": "serial",
+        "samples_ms": [
+          64.74119401536882,
+          69.95292700594291,
+          66.47618697024882
+        ],
+        "median_ms": 66.47618697024882,
+        "records_per_s": 15.042980736057356,
+        "optimizer_steps": 1,
+        "cuda_peak_allocated_mb": 0.0,
+        "gpu_before": "99, 3646, 12288",
+        "gpu_after": "96, 3646, 12288"
+      },
+      {
+        "stage": "timing",
+        "atoms": 63,
+        "device": "cpu",
+        "dtype": "torch.float32",
+        "threads": 2,
+        "records": 8,
+        "batch": 8,
+        "method": "tensor",
+        "samples_ms": [
+          52.19564802246168,
+          55.18946697702631,
+          56.42681202152744
+        ],
+        "median_ms": 55.18946697702631,
+        "records_per_s": 144.95519594944005,
+        "optimizer_steps": 1,
+        "cuda_peak_allocated_mb": 0.0,
+        "gpu_before": "98, 3646, 12288",
+        "gpu_after": "99, 3646, 12288"
+      }
+    ]
+  }
+}
