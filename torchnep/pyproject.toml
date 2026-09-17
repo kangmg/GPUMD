@@ -66,5 +66,5 @@ path = "torchnep/__init__.py"
 packages = ["torchnep"]
 
 [tool.hatch.build.targets.sdist]
-include = ["torchnep/**/*.py", "README.md", "QNEP_REFERENCE.md", "LICENSE", "pyproject.toml", "assets", "releaseNotes.md"]
+include = ["torchnep/**/*.py", "README.md", "QNEP_REFERENCE.md", "QNEP_PERFORMANCE.md", "LICENSE", "pyproject.toml", "assets", "releaseNotes.md"]
 exclude = [".gitignore", "tests", "my_test", ".github"]

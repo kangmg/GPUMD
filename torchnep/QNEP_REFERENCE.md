@@ -175,6 +175,13 @@ agreement, symmetries, checkpoint round trips, masks, weights, and selected
 GPUMD comparisons. They do not establish material accuracy, vacuum convergence,
 or molecular-dynamics stability.
 
+## Performance measurements
+
+See [QNEP_PERFORMANCE.md](QNEP_PERFORMANCE.md) for measured CPU/GPU timings,
+CPU thread-count comparisons, the distinction between gradient accumulation
+and experimental tensor batching, and bounded reproduction commands. These
+measurements are specific to the recorded model, structures, and hardware.
+
 ## Validation required for releases
 
 CPU CI runs the TorchNEP pytest suite. CUDA-only tests and external GPUMD
