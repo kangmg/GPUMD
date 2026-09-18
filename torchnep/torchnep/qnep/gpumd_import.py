@@ -4,8 +4,8 @@ from pathlib import Path
 
 import torch
 
-from .model import QNEPConfig, QNEPModel
 from .errors import QNEPError
+from .model import QNEPConfig, QNEPModel
 
 
 def load_gpumd_reference(path: str | Path) -> QNEPModel:
@@ -59,7 +59,7 @@ def load_gpumd_reference(path: str | Path) -> QNEPModel:
             offset += neurons
             model.charge_weights[species].copy_(values[offset : offset + neurons])
             offset += neurons
-        # sqrt(epsilon_inf) is used for BEC reporting, not mode 2 energy or force.
+        model.config = config._replace(sqrt_epsilon_inf=values[offset].item())
         offset += 1
         model.nep.b1.copy_(values[offset])
         offset += 1
