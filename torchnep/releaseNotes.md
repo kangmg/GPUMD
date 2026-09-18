@@ -1,5 +1,17 @@
 # Release Notes
 
+## 1.0.5a1+qnep3
+
+- Adds atomic native `nep4_charge2` export through `QNEPModel.export_nep(path)`
+  for GPUMD/Calorine inference, with explicit representability checks. Native
+  CPU force parity is verified with Calorine 3.5; Calorine 3.3 has a qNEP force
+  derivative defect and is excluded from the supported inference path.
+- Dedicated training publishes validation-best `nep.txt` and `nep_best.txt`,
+  plus latest `nep_last.txt`, including no-op and early-stopped resume.
+- Reference CLI adds `--output` (default `nep.txt`) while preserving
+  `--checkpoint`. Existing inference/training checkpoint formats and result
+  checkpoint paths are unchanged; earlier model configurations remain readable.
+
 ## 1.0.5a1+qnep2
 
 - Adds the dedicated qNEP mode-2 training contract: explicit held-out
