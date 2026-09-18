@@ -11,6 +11,7 @@ from ase.io import read
 from .checkpoint import save_checkpoint
 from .data_io import load_records
 from .errors import QNEPError
+from .gpumd_export import validate_gpumd_export
 from .model import QNEPConfig, QNEPModel
 from .run_config import QNEPDatasets, QNEPRunConfig
 from .structure import QNEPStructure
@@ -21,13 +22,17 @@ from .training_checkpoint import TrainingCheckpointState, read_training_checkpoi
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train a neutral 3D qNEP mode 2 reference checkpoint"
+        description="Train a neutral 3D qNEP mode 2 native GPUMD model"
     )
     parser.add_argument(
         "dataset", type=Path, help="extxyz with frozen energy and/or forces labels"
     )
     parser.add_argument("--elements", nargs="+")
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--output", type=Path,
+        help="reference route native GPUMD/Calorine output (default: nep.txt)",
+    )
     parser.add_argument("--steps", type=int)
     parser.add_argument("--validation", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -74,7 +79,9 @@ def _is_new_route(arguments: argparse.Namespace) -> bool:
 
 
 def _select_route(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> str:
-    legacy = arguments.checkpoint is not None or arguments.steps is not None
+    legacy = any(
+        value is not None for value in (arguments.checkpoint, arguments.steps, arguments.output)
+    )
     training = _is_new_route(arguments)
     if legacy and training:
         parser.error("legacy and training options cannot be combined")
@@ -96,26 +103,18 @@ def _select_route(parser: argparse.ArgumentParser, arguments: argparse.Namespace
 
 
 def _legacy_model(arguments: argparse.Namespace) -> QNEPModel:
-    torch.manual_seed(0 if arguments.seed is None else arguments.seed)
-    return (
-        QNEPModel(
-            QNEPConfig(
-                type_names=tuple(arguments.elements),
-                cutoff_radial=6.0
-                if arguments.cutoff_radial is None
-                else arguments.cutoff_radial,
-                cutoff_angular=4.0
-                if arguments.cutoff_angular is None
-                else arguments.cutoff_angular,
-            )
-        )
-        .double()
-        .to("cpu" if arguments.device is None else arguments.device)
-    )
+    return _training_model(
+        _model_config(arguments, None), "float64",
+        0 if arguments.seed is None else arguments.seed,
+    ).to("cpu" if arguments.device is None else arguments.device)
 
 
 def _legacy_train(arguments: argparse.Namespace) -> None:
     model = _legacy_model(arguments)
+    validate_gpumd_export(model)
+    native_path = Path("nep.txt") if arguments.output is None else arguments.output
+    if native_path.resolve() == arguments.checkpoint.resolve():
+        raise QNEPError("--output and --checkpoint must name different files")
     samples: list[TrainingSample] = []
     for atoms in read(arguments.dataset, index=":", format="extxyz"):
         labels = {} if atoms.calc is None else atoms.calc.results
@@ -151,8 +150,10 @@ def _legacy_train(arguments: argparse.Namespace) -> None:
         ),
     )
     save_checkpoint(model, arguments.checkpoint)
+    model.export_nep(native_path)
     print(f"steps={len(losses)} initial_loss={losses[0]:.8g} final_loss={losses[-1]:.8g}")
     print(f"checkpoint={arguments.checkpoint}")
+    print(f"nep={native_path}")
 
 
 def _model_config(
@@ -243,6 +244,9 @@ def _training_run(arguments: argparse.Namespace) -> None:
     print(f"best_checkpoint={result.best_inference_path}")
     print(f"latest_checkpoint={result.latest_inference_path}")
     print(f"training_checkpoint={result.training_checkpoint_path}")
+    print(f"nep={result.nep_path}")
+    print(f"best_nep={result.best_nep_path}")
+    print(f"latest_nep={result.latest_nep_path}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

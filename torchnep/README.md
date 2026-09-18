@@ -59,7 +59,8 @@ package dependencies.
 The original small reference route remains available:
 
 ```bash
-python -m torchnep.qnep train.xyz --elements H O --checkpoint qnep.pt --steps 100
+python -m torchnep.qnep train.xyz --elements H O --checkpoint qnep.pt \
+  --output nep.txt --steps 100
 ```
 
 For held-out validation, reproducible checkpoints, and resume, use the
@@ -70,8 +71,13 @@ python -m torchnep.qnep train.xyz --validation valid.xyz --output-dir qnep-run \
   --elements H O --epochs 100 --batch-size 2 --precision float64
 ```
 
-It writes the latest inference model, the strictly best validation model, and
-a resumable training checkpoint. See [the qNEP reference](QNEP_REFERENCE.md)
+It writes native GPUMD/Calorine `nep.txt` from the strictly best validation
+model, plus `nep_best.txt` and `nep_last.txt`. Existing `.pt` files remain
+internal checkpoints for training and resume. Custom loops publish their
+selected weights with `model.export_nep("nep.txt")`.
+Use Calorine **3.5** for native CPU mode-2 inference; version 3.3 has a force
+derivative defect on the verified qNEP fixture.
+See [the qNEP reference](QNEP_REFERENCE.md)
 for record metadata, masks and weights, provenance and resume rules, supported
 boundaries, and the required local GPU/GPUMD validation.
 

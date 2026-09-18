@@ -108,3 +108,18 @@ class QNEPTrainingResult:
     best_inference_path: Path
     latest_inference_path: Path
     training_checkpoint_path: Path
+
+    @property
+    def nep_path(self) -> Path:
+        """Canonical native inference model selected by validation."""
+        return self.best_inference_path.parent / "nep.txt"
+
+    @property
+    def best_nep_path(self) -> Path:
+        """Native model from the best validation epoch."""
+        return self.best_inference_path.parent / "nep_best.txt"
+
+    @property
+    def latest_nep_path(self) -> Path:
+        """Native model from the latest saved epoch."""
+        return self.latest_inference_path.parent / "nep_last.txt"

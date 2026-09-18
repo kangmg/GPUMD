@@ -1,7 +1,8 @@
 # qNEP mode 2 reference and trainer
 
-TorchNEP **1.0.5a1+qnep2** provides an independent, PyTorch qNEP mode-2
-reference implementation and a dedicated trainer. The ordinary TorchNEP
+TorchNEP **1.0.5a1+qnep3** provides an independent, PyTorch qNEP mode-2
+reference implementation, a dedicated trainer, and native GPUMD/Calorine
+model export. The ordinary TorchNEP
 `train_nep` APIs remain unchanged.
 
 qNEP accepts only neutral, fully three-dimensional periodic structures. It
@@ -11,11 +12,12 @@ has no required runtime dependencies and supports Python 3.9 or newer.
 
 ## Routes
 
-The existing reference route is retained for compact experiments and produces
-an inference checkpoint directly:
+The reference route is retained for compact experiments and produces native
+`nep.txt` plus an internal inference checkpoint:
 
 ```bash
-python -m torchnep.qnep train.xyz --elements H O --checkpoint qnep.pt --steps 100
+python -m torchnep.qnep train.xyz --elements H O --checkpoint qnep.pt \
+  --output nep.txt --steps 100
 ```
 
 The dedicated route requires an explicit held-out validation file and an output
@@ -70,7 +72,7 @@ result = train_qnep(
     datasets,
     QNEPRunConfig(output_dir=Path("qnep-run"), epochs=100, batch_size=2),
 )
-print(result.best_inference_path)
+print(result.nep_path)  # native GPUMD/Calorine model
 ```
 
 `QNEPRecord` contains a `TrainingSample` plus optional `record_id` and
@@ -119,20 +121,62 @@ energy-plus-force objective; it excludes the raw-charge penalty.
 ## Artifacts and checkpoint compatibility
 
 Each dedicated run records `run.json` before training and appends epoch rows to
-`metrics.jsonl`. Checkpoint boundaries write:
+`metrics.jsonl`. Native models are the final inference artifacts; `.pt` files
+remain internal model/training checkpoints:
 
 | Path | Meaning |
 | --- | --- |
+| `nep.txt` | Canonical native model, identical to the best validation model. |
+| `nep_best.txt` | Native model from the strict best validation epoch. |
+| `nep_last.txt` | Native model at the latest checkpoint boundary. |
 | `last.training.pt` | Authoritative resumable training state at the saved epoch. |
 | `latest.qnep.pt` | Inference model at the latest completed epoch. |
 | `best.qnep.pt` | Inference model from the strict best validation metric. |
 
-Ties retain the earlier best epoch. The caller's model remains at the latest
-weights; load `best.qnep.pt` explicitly when the best model is needed.
+`QNEPTrainingResult.nep_path`, `.best_nep_path`, and `.latest_nep_path` expose
+the native paths. Existing checkpoint path attributes are unchanged. Ties
+retain the earlier best epoch. Best native files update on improvement; latest
+native files update at each checkpoint boundary, including the final epoch.
+The caller's model remains at the latest weights.
+
+Custom training loops, including multi-teacher workflows, export their selected
+weights directly with `model.export_nep("nep.txt")`. This writes a standard
+non-ZBL `nep4_charge2` model atomically without changing model weights or RNG.
+The output carries the energy and charge heads, shared energy bias, descriptor
+coefficients, descriptor scaling, and `sqrt_epsilon_inf` metadata. That metadata
+scales native BEC output; qNEP does not fit a dielectric response or BEC targets.
+The exporter requires `reciprocal_cutoff_factor=1.0`, radial cutoff at least as
+large as angular cutoff, valid elements, native-supported descriptor sizes,
+and finite parameters representable by the native float32 runtime. Unsupported
+settings fail explicitly. The dedicated trainer checks exportability before
+starting training or creating its output directory.
+Exported neighbor capacities are `819` for both cutoffs; GPUMD enlarges these
+allocations to `1024`. This fixed capacity does not guarantee support for
+arbitrarily dense geometries.
+
+Use Calorine **3.5** for native CPU inference with these mode-2 exports. On a
+two-epoch trained fixture, its maximum absolute differences from the same
+PyTorch weights were `3.96e-11` eV for energy, `1.63e-9` eV/Å for forces, and
+`1.02e-10` e for charges. The native GPUMD force difference was `3.15e-8` eV/Å.
+Calorine 3.3 failed the same force comparison (`2.31e-4` eV/Å), despite matching
+energy and charges, and should not be used for this exported qNEP inference
+path. Version 3.5 includes the neutral-charge projection chain-rule correction
+missing from 3.3. These are software parity checks on one fixture, not material
+accuracy or stability claims. Calorine remains an optional inference runtime;
+TorchNEP adds no required package dependency.
+
+The low-level `fit(model, samples, config)` API continues returning loss history
+without choosing an output directory. Call `model.export_nep("nep.txt")` after
+`fit` to publish the resulting weights. The reference CLI does this automatically;
+its `--output` defaults to `nep.txt`, while `--checkpoint` retains its existing
+internal checkpoint behavior. These two paths must be different.
 
 Inference uses the backward-compatible
 `torchnep-qnep-mode2-reference-v1` payload. It includes model configuration
-and weights and remains portable between supported inference devices. Training
+and weights and remains portable between supported inference devices. Existing
+qnep1/qnep2 inference states and qnep2 training checkpoints remain readable;
+older configurations default `sqrt_epsilon_inf` to `1.0`. Producer version
+equality is not added as a resume requirement. Training
 state uses the separate `torchnep-qnep-mode2-training-v1` payload, with model
 and optimizer state, best state, epoch/step/patience state, metric history,
 dataset and settings fingerprints, snapshot ID, shuffle and runtime RNG state,
@@ -149,7 +193,8 @@ and deterministic settings. Cross-device resume is rejected; inference remains
 device-portable. If a checkpoint is interrupted across artifact writes, its
 saved history is authoritative and rebuilds the continued metrics sequence.
 If saved early-stop patience is already exhausted, resume materializes the
-best/latest inference artifacts, metrics, and training checkpoint without an
+best/latest native models, canonical `nep.txt`, internal inference checkpoints,
+metrics, and training checkpoint without an
 additional optimizer epoch, even when the requested target equals or exceeds
 the completed epoch.
 
@@ -159,13 +204,13 @@ the completed epoch.
   neutral projected charges. Neighbour topology is rebuilt for evaluation, and
   force loss differentiates through the full energy.
 - `load_gpumd_reference` accepts the supported non-ZBL `nep4_charge2` reference
-  layout for numerical energy/force comparisons. qNEP checkpoint export to
-  GPUMD text is unsupported.
+  layout for numerical energy/force comparisons and exported-model round trips.
+  Native `nep.txt` is the deployment artifact for Calorine/GPUMD inference.
 - ASE exposes energy, forces, and latent charges. Stress and cell derivatives
   are not supported.
 
 Unsupported: charged cells, partial or nonperiodic boundaries, mode 1, ZBL
-import, BEC labels, stress/NPT, Extended LES multipoles, GPUMD export, custom
+import, BEC labels, stress/NPT, Extended LES multipoles, custom
 CUDA kernels, distributed training, and automatic teacher/alignment/splitting
 workflows. A vacuum cell remains periodic, so use of isolated-molecule or slab
 labels requires a separate convergence study.
