@@ -1,0 +1,7 @@
+{
+  "include": ["benchmark.py", "batch_prototype.py", "cpu_jobs.py"],
+  "pythonVersion": "3.12",
+  "executionEnvironments": [
+    {"root": ".", "extraPaths": ["../.."]}
+  ]
+}
