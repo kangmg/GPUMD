@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import NamedTuple
 
 import torch
@@ -23,6 +24,7 @@ class QNEPConfig(NamedTuple):
     l_max: tuple[int, int, int] = (2, 0, 0)
     neuron: int = 16
     reciprocal_cutoff_factor: float = 1.0
+    sqrt_epsilon_inf: float = 1.0
 
 
 class QNEPResult(NamedTuple):
@@ -142,7 +144,8 @@ class QNEPModel(nn.Module):
             total, short_range, electrostatic, raw_charges, charges, forces
         )
 
-    def export_nep(self, path: str) -> None:
-        raise NotImplementedError(
-            "qNEP reference checkpoints cannot be exported as GPUMD nep.txt"
-        )
+    def export_nep(self, path: str | Path) -> None:
+        """Write this model as native nep4_charge2, replacing the file atomically."""
+        from .gpumd_export import export_gpumd
+
+        export_gpumd(self, path)

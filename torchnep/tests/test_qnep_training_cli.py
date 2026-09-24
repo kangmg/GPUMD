@@ -8,7 +8,6 @@ from pathlib import Path
 import torch
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import write
-
 from torchnep.qnep import QNEPConfig, QNEPModel, QNEPStructure
 
 
@@ -139,6 +138,9 @@ def test_training_cli_trains_mixed_labels_then_resumes(tmp_path: Path) -> None:
     assert (output_dir / "best.qnep.pt").is_file()
     assert (output_dir / "latest.qnep.pt").is_file()
     assert (output_dir / "last.training.pt").is_file()
+    assert f"nep={output_dir / 'nep.txt'}" in resumed.stdout
+    assert (output_dir / "nep.txt").read_bytes() == (output_dir / "nep_best.txt").read_bytes()
+    assert (output_dir / "nep_last.txt").is_file()
 
 
 def test_training_cli_rejects_mixed_legacy_and_training_routes(tmp_path: Path) -> None:

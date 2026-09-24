@@ -8,6 +8,7 @@ import torch
 from .. import __version__
 from .batching import backward_weighted_batch, make_shuffle_generator, shuffled_batches
 from .errors import QNEPError
+from .gpumd_export import validate_gpumd_export
 from .metrics import (
     EpochMetricsRow,
     atomic_save_inference,
@@ -18,7 +19,8 @@ from .metrics import (
     model_content_hash,
     run_manifest,
     sample_to_model,
-    save_inference_state,
+    save_best_inference,
+    save_best_inference_state,
     validate_output_dir,
 )
 from .model import QNEPModel
@@ -88,6 +90,7 @@ def train_qnep(
     datasets: QNEPDatasets,
     config: QNEPRunConfig,
 ) -> QNEPTrainingResult:
+    validate_gpumd_export(model)
     validate_output_dir(config)
     identities = validate_datasets(datasets, model, config)
     initial_model_hash = model_content_hash(model.state_dict())
@@ -140,8 +143,9 @@ def train_qnep(
     )
     if resume_state is not None:
         atomic_write_text(metrics_path, metrics_history_text(history))
-        save_inference_state(model.config, best_model_state, best_path)
+        save_best_inference_state(model.config, best_model_state, best_path)
         atomic_save_inference(model, latest_path)
+        model.export_nep(config.output_dir / "nep_last.txt")
 
     loss_config = TrainingConfig(
         learning_rate=config.learning_rate,
@@ -154,6 +158,7 @@ def train_qnep(
         config.early_stop_patience is not None
         and patience_count >= config.early_stop_patience
     )
+    stop_reason = "early_stopping" if early_stopping else "completed"
     if completed_epoch == config.epochs or early_stopping:
         state = _checkpoint_state(
             model,
@@ -172,18 +177,9 @@ def train_qnep(
             shuffle_generator,
         )
         save_training_checkpoint(state, checkpoint_path)
-        return QNEPTrainingResult(
-            completed_epoch=completed_epoch,
-            optimizer_step=optimizer_step,
-            best_epoch=best_epoch,
-            stop_reason="early_stopping" if early_stopping else "completed",
-            best_inference_path=best_path,
-            latest_inference_path=latest_path,
-            training_checkpoint_path=checkpoint_path,
-        )
 
-    stop_reason = "completed"
-    for epoch in range(completed_epoch + 1, config.epochs + 1):
+    epochs = () if early_stopping else range(completed_epoch + 1, config.epochs + 1)
+    for epoch in epochs:
         model.train()
         for indices in shuffled_batches(
             len(datasets.train), config.batch_size, shuffle_generator
@@ -244,8 +240,9 @@ def train_qnep(
             )
             save_training_checkpoint(state, checkpoint_path)
             atomic_save_inference(model, latest_path)
+            model.export_nep(config.output_dir / "nep_last.txt")
         if improved:
-            atomic_save_inference(model, best_path)
+            save_best_inference(model, best_path)
         with metrics_path.open("a", encoding="utf-8") as metrics_file:
             metrics_file.write(json.dumps(row, allow_nan=False, sort_keys=True) + "\n")
         if early_stop:

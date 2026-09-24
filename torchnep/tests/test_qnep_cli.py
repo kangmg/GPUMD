@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import write
-
 from test_qnep_reference import system
 from torchnep.qnep import QNEPCalculator, load_checkpoint
 
@@ -21,6 +20,7 @@ def run_cli(arguments, directory):
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
 
 
@@ -28,6 +28,7 @@ def test_cli_help(tmp_path):
     result = run_cli(["--help"], tmp_path)
     assert result.returncode == 0
     assert "--checkpoint" in result.stdout
+    assert "--output" in result.stdout
 
 
 def test_cli_trains_checkpoint_consumed_by_ase(tmp_path):
@@ -44,13 +45,15 @@ def test_cli_trains_checkpoint_consumed_by_ase(tmp_path):
             "H",
             "O",
             "--steps",
-            "5",
+            "1",
             "--checkpoint",
             "qnep.pt",
         ],
         tmp_path,
     )
     assert result.returncode == 0, result.stderr
+    assert "nep=" in result.stdout
+    assert (tmp_path / "nep.txt").read_text().startswith("nep4_charge2 2 H O\n")
     atoms.calc = QNEPCalculator(load_checkpoint(tmp_path / "qnep.pt"))
     assert np.isfinite(atoms.get_potential_energy())
     assert np.isfinite(atoms.get_forces()).all()

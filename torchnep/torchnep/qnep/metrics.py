@@ -26,6 +26,9 @@ _OWNED_FILES = {
     "best.qnep.pt",
     "last.training.pt",
     "latest.qnep.pt",
+    "nep.txt",
+    "nep_best.txt",
+    "nep_last.txt",
     "metrics.jsonl",
     "run.json",
 }
@@ -190,14 +193,21 @@ def atomic_save_inference(model: QNEPModel, path: Path) -> None:
             temporary_path.unlink()
 
 
-def save_inference_state(
+def save_best_inference(model: QNEPModel, path: Path) -> None:
+    atomic_save_inference(model, path)
+    native_path = path.parent / "nep_best.txt"
+    model.export_nep(native_path)
+    atomic_write_text(path.parent / "nep.txt", native_path.read_text(encoding="utf-8"))
+
+
+def save_best_inference_state(
     config: QNEPConfig, state: Mapping[str, torch.Tensor], path: Path
 ) -> None:
     devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
     with torch.random.fork_rng(devices=devices):
         saved_model = QNEPModel(config).to(dtype=state["nep.b1"].dtype)
         saved_model.load_state_dict(state, strict=True)
-        atomic_save_inference(saved_model, path)
+        save_best_inference(saved_model, path)
 
 
 def validate_output_dir(config: QNEPRunConfig) -> None:

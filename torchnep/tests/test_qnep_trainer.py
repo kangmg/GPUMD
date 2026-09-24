@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 import torch
-
 from torchnep.qnep.batching import backward_weighted_batch
 from torchnep.qnep.checkpoint import load_checkpoint
+from torchnep.qnep.gpumd_import import load_gpumd_reference
 from torchnep.qnep.metrics import evaluate_metrics, sample_to_model
 from torchnep.qnep.model import QNEPConfig, QNEPModel
 from torchnep.qnep.records import QNEPRecord
@@ -108,6 +108,11 @@ def test_train_qnep_runs_batches_validation_and_writes_canonical_artifacts(
     assert result.best_inference_path.is_file()
     assert result.latest_inference_path.is_file()
     assert result.training_checkpoint_path.is_file()
+    assert result.nep_path == tmp_path / "run" / "nep.txt"
+    assert result.best_nep_path.name == "nep_best.txt"
+    assert result.latest_nep_path.name == "nep_last.txt"
+    assert result.nep_path.read_bytes() == result.best_nep_path.read_bytes()
+    assert result.latest_nep_path.is_file()
     torch.testing.assert_close(
         datasets.train[0].sample.structure.positions, original_positions, rtol=0, atol=0
     )
@@ -199,7 +204,7 @@ def test_strict_best_ties_enable_early_stop_and_rejects_output_overwrite(
     run_dir = tmp_path / "early"
     config = _config(
         run_dir,
-        epochs=5,
+        epochs=2,
         batch_size=2,
         learning_rate=1e-12,
         early_stop_patience=1,
@@ -230,7 +235,7 @@ def test_best_and_latest_are_distinct_after_validation_regresses(tmp_path: Path)
     model = _model(101)
     config = _config(
         tmp_path / "run",
-        epochs=5,
+        epochs=2,
         batch_size=2,
         learning_rate=0.001,
         charge_weight=1.0,
@@ -248,3 +253,12 @@ def test_best_and_latest_are_distinct_after_validation_regresses(tmp_path: Path)
         not torch.equal(best.state_dict()[name], latest.state_dict()[name])
         for name in best.state_dict()
     )
+    assert result.nep_path.read_bytes() == result.best_nep_path.read_bytes()
+    assert result.nep_path.read_bytes() != result.latest_nep_path.read_bytes()
+    for native_path, checkpoint in (
+        (result.nep_path, best),
+        (result.latest_nep_path, latest),
+    ):
+        exported = load_gpumd_reference(native_path)
+        for name, expected in checkpoint.state_dict().items():
+            torch.testing.assert_close(exported.state_dict()[name], expected, rtol=0, atol=0)

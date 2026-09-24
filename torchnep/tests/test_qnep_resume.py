@@ -354,6 +354,9 @@ def test_resume_exhausted_patience_materializes_state_without_optimizer_steps(
         assert result.best_inference_path.is_file()
         assert result.latest_inference_path.is_file()
         assert result.training_checkpoint_path.is_file()
+        assert result.nep_path.read_bytes() == stopped.nep_path.read_bytes()
+        assert result.best_nep_path.read_bytes() == stopped.best_nep_path.read_bytes()
+        assert result.latest_nep_path.read_bytes() == stopped.latest_nep_path.read_bytes()
         assert _metrics_epochs(result.training_checkpoint_path.parent / "metrics.jsonl") == [1, 2]
         _assert_tree_equal(state.model_state, stopped_state.model_state)
         _assert_tree_equal(state.optimizer_state, stopped_state.optimizer_state)
